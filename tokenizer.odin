@@ -15,6 +15,9 @@ MAX_VOCAB :: 151936
 MERGE_NOT_FOUND :: 1_000_000_000
 MAX_MERGES :: 151386
 
+EMBEDDED_VOCAB :: string(#load("vocab.txt"))
+EMBEDDED_MERGES :: string(#load("merges.txt"))
+
 Merge_Rule :: struct {
 	left:  string,
 	right: string,
@@ -75,18 +78,11 @@ init_byte_unicode_map :: proc() {
 	}
 }
 
-load_vocab :: proc(t: ^Tokenizer, path: string) {
-	data, err := os.read_entire_file_from_path(path, context.allocator)
-	if err != os.ERROR_NONE {
-		fmt.eprintf("Failed to open vocab: %s (%v)\n", path, err)
-		os.exit(1)
-	}
-	defer delete(data)
-
+load_vocab_data :: proc(t: ^Tokenizer, data: string) {
 	t.vocab = make([dynamic]string, 0, MAX_VOCAB)
 	t.vocab_lookup = make(map[string]int)
 
-	for line in strings.split_lines(string(data)) {
+	for line in strings.split_lines(data) {
 		if len(line) == 0 do continue
 		if len(t.vocab) >= MAX_VOCAB {
 			fmt.eprintf("vocab exceeds MAX_VOCAB (%d)\n", MAX_VOCAB)
@@ -99,18 +95,11 @@ load_vocab :: proc(t: ^Tokenizer, path: string) {
 	}
 }
 
-load_merges :: proc(t: ^Tokenizer, path: string) {
-	data, err := os.read_entire_file_from_path(path, context.allocator)
-	if err != os.ERROR_NONE {
-		fmt.eprintf("Failed to open merges: %s (%v)\n", path, err)
-		os.exit(1)
-	}
-	defer delete(data)
-
+load_merges_data :: proc(t: ^Tokenizer, data: string) {
 	t.merges = make([dynamic]Merge_Rule, 0, MAX_MERGES)
 	rank := 0
 
-	for line in strings.split_lines(string(data)) {
+	for line in strings.split_lines(data) {
 		if len(line) == 0 || line[0] == '#' do continue
 		parts := strings.fields(line)
 		if len(parts) < 2 do continue
@@ -123,10 +112,37 @@ load_merges :: proc(t: ^Tokenizer, path: string) {
 	}
 }
 
+load_vocab_file :: proc(t: ^Tokenizer, path: string) -> bool {
+	data, err := os.read_entire_file_from_path(path, context.temp_allocator)
+	if err != os.ERROR_NONE do return false
+	load_vocab_data(t, string(data))
+	return true
+}
+
+load_merges_file :: proc(t: ^Tokenizer, path: string) -> bool {
+	data, err := os.read_entire_file_from_path(path, context.temp_allocator)
+	if err != os.ERROR_NONE do return false
+	load_merges_data(t, string(data))
+	return true
+}
+
+// Prefer vocab.txt / merges.txt in the current directory; fall back to data
+// embedded at compile time (#load) so a lone binary still works for distribution.
 build_tokenizer :: proc(t: ^Tokenizer, vocab_path: string = "vocab.txt", merges_path: string = "merges.txt") {
 	init_byte_unicode_map()
-	load_vocab(t, vocab_path)
-	load_merges(t, merges_path)
+
+	vocab_ok := load_vocab_file(t, vocab_path)
+	merges_ok := load_merges_file(t, merges_path)
+
+	if !vocab_ok {
+		load_vocab_data(t, EMBEDDED_VOCAB)
+	}
+	if !merges_ok {
+		load_merges_data(t, EMBEDDED_MERGES)
+	}
+	if !vocab_ok || !merges_ok {
+		fmt.eprintln("tokenizer: using embedded vocab/merges (place vocab.txt merges.txt in cwd to override)")
+	}
 }
 
 verify_tokenizer :: proc(t: ^Tokenizer) -> bool {

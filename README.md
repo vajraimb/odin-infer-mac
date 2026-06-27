@@ -42,9 +42,13 @@ interactive one, at roughly half of llama.cpp's heavily-optimized throughput.
 
 ## Requirements
 
-- [Odin compiler](https://odin-lang.org/) (dev-2026-06 or later)
+- [Odin compiler](https://odin-lang.org/) (dev-2026-06 or later) — only needed to build from source
 - A Qwen3 GGUF model file
-- `vocab.txt`, `merges.txt` (included; shared by all Qwen3 models)
+
+The BPE tokenizer (`vocab.txt` + `merges.txt`, ~3 MB) is also **embedded at compile
+time** via Odin `#load`, so a lone binary works for distribution. At runtime,
+files in the current directory take precedence (handy when hacking the tokenizer
+without rebuilding).
 
 ## Download a model
 
@@ -62,19 +66,38 @@ curl -L -o Qwen3-0.6B-Q4_K_M.gguf \
 
 ## Build
 
+Release binary (recommended for distribution):
+
 ```sh
-odin build . -out:qwen3 -o:speed -no-bounds-check -disable-assert -microarch:native
+./build.sh
+# -> ./odin-infer-mac  (~3.5 MB, tokenizer embedded)
+```
+
+Or manually:
+
+```sh
+odin build . -out:odin-infer-mac -o:speed -no-bounds-check -disable-assert -microarch:native
 ```
 
 ## Run
 
 ```sh
-./qwen3 Qwen3-0.6B-Q8_0.gguf -t 0 -j 4 -r 1 -f 1   # greedy, 4 threads, show tok/s + TTFT
-./qwen3 Qwen3-0.6B-Q4_K_M.gguf                      # sampling defaults
-./qwen3 Qwen3-8B-Q4_K_M.gguf -g 1 -r 1 -f 1        # Apple Silicon GPU (Metal)
-./qwen3 Qwen3-0.6B-Q8_0.gguf -m 1 -k 1             # multi-turn + reasoning
-./qwen3 <model>.gguf --dump                         # inspect tensors / quant types
+./odin-infer-mac Qwen3-0.6B-Q8_0.gguf -t 0 -j 4 -r 1 -f 1   # greedy, 4 threads, show tok/s + TTFT
+./odin-infer-mac Qwen3-0.6B-Q4_K_M.gguf                      # sampling defaults
+./odin-infer-mac Qwen3-8B-Q4_K_M.gguf -g 1 -r 1 -f 1        # Apple Silicon GPU (Metal)
+./odin-infer-mac Qwen3-0.6B-Q8_0.gguf -m 1 -k 1             # multi-turn + reasoning
+./odin-infer-mac <model>.gguf --dump                         # inspect tensors / quant types
 ```
+
+## Distribute
+
+Copy two files to another Mac (Apple Silicon):
+
+1. `odin-infer-mac` — the built executable
+2. `Qwen3-*.gguf` — any Qwen3 model
+
+No Odin install, no `vocab.txt` / `merges.txt`, no other dependencies. First
+run on an unsigned binary may require: `xattr -cr odin-infer-mac`.
 
 ## Options
 

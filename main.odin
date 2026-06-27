@@ -102,7 +102,7 @@ chat :: proc(
 				if id == 0 {
 					fmt.fprintln(
 						os.stderr,
-						"Warning: some prompt text could not be tokenized. Ensure vocab.txt and merges.txt are in the current directory.",
+						"Warning: some prompt text could not be tokenized.",
 					)
 					break
 				}
@@ -367,7 +367,7 @@ main :: proc() {
 	build_tokenizer(&tokenizer)
 	defer free_tokenizer(&tokenizer)
 	if !verify_tokenizer(&tokenizer) {
-		fmt.eprintln("Tokenizer self-check failed. Run from the project directory containing vocab.txt and merges.txt.")
+		fmt.eprintln("Tokenizer self-check failed.")
 		os.exit(1)
 	}
 
