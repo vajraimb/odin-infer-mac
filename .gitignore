@@ -1,0 +1,13 @@
+# Model weights (download separately)
+*.gguf
+
+# Binaries
+qwen3
+qwen3d
+qwen3.exe
+q_asan
+
+# Build/debug artifacts
+*.dSYM/
+*.log
+*.o
