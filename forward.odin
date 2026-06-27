@@ -2,7 +2,9 @@
 
 package main
 
+import "core:fmt"
 import "core:math"
+import "core:os"
 
 rmsnorm :: proc(o, x, weight: []f32, eps: f32) {
 	size := len(x)
@@ -46,6 +48,15 @@ forward :: proc(transformer: ^Transformer, token: int, pos: int) -> []f32 {
 	p := &transformer.config
 	w := &transformer.weights
 	s := &transformer.state
+
+	if pos < 0 || pos >= p.seq_len {
+		fmt.eprintf("forward: pos=%d out of range (seq_len=%d)\n", pos, p.seq_len)
+		os.exit(1)
+	}
+	if token < 0 || token >= p.vocab_size {
+		fmt.eprintf("forward: token=%d out of range (vocab=%d)\n", token, p.vocab_size)
+		os.exit(1)
+	}
 
 	dim := p.dim
 	hidden_dim := p.hidden_dim

@@ -111,6 +111,17 @@ chat :: proc(
 			clear(&prompt_tokens)
 			append(&prompt_tokens, ..encoded)
 
+			max_ctx := transformer.config.seq_len
+			if len(prompt_tokens) >= max_ctx {
+				fmt.fprintf(
+					os.stderr,
+					"Prompt is %d tokens but context limit is %d; truncating prompt.\n",
+					len(prompt_tokens),
+					max_ctx,
+				)
+				resize(&prompt_tokens, max_ctx - 1)
+			}
+
 			pos = 0
 			user_turn = false
 
@@ -131,6 +142,26 @@ chat :: proc(
 			token = multi_turn ? tb.data[pos] : prompt_tokens[pos]
 		} else {
 			token = next
+		}
+
+		if pos >= transformer.config.seq_len {
+			fmt.fprintln(os.stderr, "\nContext limit reached; stopping generation.")
+			fmt.println()
+			user_turn = true
+			if tps && timer >= 0 {
+				elapsed := f64(time_in_ms()) - timer
+				if elapsed > 0 {
+					fmt.eprintf("tok/s: %f\n", f64(count) / elapsed * 1000.0)
+				}
+				timer = -1
+				count = 0
+			}
+			if ttft && t_ttft > 0 {
+				fmt.eprintf("TTFT: %d ms\n", t_ttft)
+				timer2 = -1
+				t_ttft = 0
+			}
+			continue
 		}
 
 		logits: []f32

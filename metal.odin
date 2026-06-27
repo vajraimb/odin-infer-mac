@@ -610,6 +610,15 @@ forward_gpu :: proc(transformer: ^Transformer, token: int, pos: int) -> []f32 {
 	NS.scoped_autoreleasepool()
 
 	p := &transformer.config
+	if pos < 0 || pos >= p.seq_len {
+		fmt.eprintf("forward_gpu: pos=%d out of range (seq_len=%d)\n", pos, p.seq_len)
+		os.exit(1)
+	}
+	if token < 0 || token >= p.vocab_size {
+		fmt.eprintf("forward_gpu: token=%d out of range (vocab=%d)\n", token, p.vocab_size)
+		os.exit(1)
+	}
+
 	w := &transformer.weights
 
 	dim := p.dim
