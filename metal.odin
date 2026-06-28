@@ -10,6 +10,9 @@ import MTL "vendor:darwin/Metal"
 
 PAGE_SIZE :: 16384 // Apple Silicon page size (for no-copy buffer alignment)
 
+GEMV_ROWS :: 8
+GEMV_TG   :: 256
+
 metal_enabled: bool
 m_device: ^MTL.Device
 m_queue: ^MTL.CommandQueue
@@ -31,8 +34,9 @@ m_pso_rope: ^MTL.ComputePipelineState
 m_pso_attn: ^MTL.ComputePipelineState
 m_pso_swiglu: ^MTL.ComputePipelineState
 m_pso_residual: ^MTL.ComputePipelineState
+m_pso_store_kv: ^MTL.ComputePipelineState
 
-// Stage B: resident run-state + KV cache on the GPU (shared memory).
+// Stage B/C: resident run-state + KV cache on the GPU (shared memory).
 m_b_x: ^MTL.Buffer
 m_b_xb: ^MTL.Buffer
 m_b_xb2: ^MTL.Buffer
@@ -40,9 +44,10 @@ m_b_xb3: ^MTL.Buffer
 m_b_q: ^MTL.Buffer
 m_b_hb: ^MTL.Buffer
 m_b_hb2: ^MTL.Buffer
-m_b_att: ^MTL.Buffer
+m_b_ktmp: ^MTL.Buffer // current-pos K (f32, contiguous) before head-major f16 store
+m_b_vtmp: ^MTL.Buffer
 m_b_logits: ^MTL.Buffer
-m_b_kc: ^MTL.Buffer
+m_b_kc: ^MTL.Buffer // f16, head-major [layer][kv_head][seq][head_dim]
 m_b_vc: ^MTL.Buffer
 m_cfg: Config
 
@@ -51,6 +56,9 @@ MSL_SRC := `
 using namespace metal;
 
 struct Dims { uint n; uint d; };
+
+constant uint GEMV_ROWS = 8;
+constant uint GEMV_SG   = 32;
 
 inline void get_scale_min_k4(int j, device const uchar *q, thread uchar &d, thread uchar &m) {
     if (j < 4) {
@@ -62,243 +70,337 @@ inline void get_scale_min_k4(int j, device const uchar *q, thread uchar &d, thre
     }
 }
 
+// 8 output rows per threadgroup; x read from device memory (L2 reuse across rows).
 kernel void gemv_f32(device const uchar *wb [[buffer(0)]],
                      device const float *x  [[buffer(1)]],
                      device float *out      [[buffer(2)]],
                      constant Dims &dim     [[buffer(3)]],
-                     uint row [[threadgroup_position_in_grid]],
+                     uint tg [[threadgroup_position_in_grid]],
                      uint tid [[thread_position_in_threadgroup]]) {
-    if (row >= dim.d) return;
-    device const float *w = (device const float*)wb + (ulong)row * dim.n;
+    uint row = tg * GEMV_ROWS + tid / GEMV_SG;
+    uint lane = tid % GEMV_SG;
     float sum = 0.0;
-    for (uint j = tid; j < dim.n; j += 32) sum += w[j] * x[j];
+    if (row < dim.d) {
+        device const float *w = (device const float*)wb + (ulong)row * dim.n;
+        for (uint j = lane; j < dim.n; j += GEMV_SG) sum += w[j] * x[j];
+    }
     sum = simd_sum(sum);
-    if (tid == 0) out[row] = sum;
+    if (lane == 0 && row < dim.d) out[row] = sum;
 }
 
 kernel void gemv_f16(device const uchar *wb [[buffer(0)]],
                      device const float *x  [[buffer(1)]],
                      device float *out      [[buffer(2)]],
                      constant Dims &dim     [[buffer(3)]],
-                     uint row [[threadgroup_position_in_grid]],
+                     uint tg [[threadgroup_position_in_grid]],
                      uint tid [[thread_position_in_threadgroup]]) {
-    if (row >= dim.d) return;
-    device const half *w = (device const half*)wb + (ulong)row * dim.n;
+    uint row = tg * GEMV_ROWS + tid / GEMV_SG;
+    uint lane = tid % GEMV_SG;
     float sum = 0.0;
-    for (uint j = tid; j < dim.n; j += 32) sum += (float)w[j] * x[j];
+    if (row < dim.d) {
+        device const half *w = (device const half*)wb + (ulong)row * dim.n;
+        for (uint j = lane; j < dim.n; j += GEMV_SG)
+            sum += (float)w[j] * x[j];
+    }
     sum = simd_sum(sum);
-    if (tid == 0) out[row] = sum;
+    if (lane == 0 && row < dim.d) out[row] = sum;
 }
 
 kernel void gemv_q8_0(device const uchar *wb [[buffer(0)]],
                       device const float *x  [[buffer(1)]],
                       device float *out      [[buffer(2)]],
                       constant Dims &dim     [[buffer(3)]],
-                      uint row [[threadgroup_position_in_grid]],
+                      uint tg [[threadgroup_position_in_grid]],
                       uint tid [[thread_position_in_threadgroup]]) {
-    if (row >= dim.d) return;
-    uint nb = dim.n / 32;
-    device const uchar *wr = wb + (ulong)row * nb * 34;
+    uint row = tg * GEMV_ROWS + tid / GEMV_SG;
+    uint lane = tid % GEMV_SG;
     float sum = 0.0;
-    for (uint b = tid; b < nb; b += 32) {
-        device const uchar *blk = wr + b * 34;
-        float dd = (float)(*(device const half*)blk);
-        device const char *qs = (device const char*)(blk + 2);
-        uint base = b * 32;
-        for (uint j = 0; j < 32; ++j) sum += dd * (float)qs[j] * x[base + j];
+    if (row < dim.d) {
+        uint nb = dim.n / 32;
+        device const uchar *wr = wb + (ulong)row * nb * 34;
+        for (uint b = lane; b < nb; b += GEMV_SG) {
+            device const uchar *blk = wr + b * 34;
+            float dd = (float)(*(device const half*)blk);
+            device const char *qs = (device const char*)(blk + 2);
+            uint base = b * 32;
+            float4 acc = float4(0.0);
+            for (uint j = 0; j < 32; j += 4) {
+                float4 xv = float4(x[base+j], x[base+j+1], x[base+j+2], x[base+j+3]);
+                float4 qv = float4((float)qs[j], (float)qs[j+1], (float)qs[j+2], (float)qs[j+3]);
+                acc += qv * dd * xv;
+            }
+            sum += acc.x + acc.y + acc.z + acc.w;
+        }
     }
     sum = simd_sum(sum);
-    if (tid == 0) out[row] = sum;
+    if (lane == 0 && row < dim.d) out[row] = sum;
 }
 
 kernel void gemv_q4_0(device const uchar *wb [[buffer(0)]],
                       device const float *x  [[buffer(1)]],
                       device float *out      [[buffer(2)]],
                       constant Dims &dim     [[buffer(3)]],
-                      uint row [[threadgroup_position_in_grid]],
+                      uint tg [[threadgroup_position_in_grid]],
                       uint tid [[thread_position_in_threadgroup]]) {
-    if (row >= dim.d) return;
-    uint nb = dim.n / 32;
-    device const uchar *wr = wb + (ulong)row * nb * 18;
+    uint row = tg * GEMV_ROWS + tid / GEMV_SG;
+    uint lane = tid % GEMV_SG;
     float sum = 0.0;
-    for (uint b = tid; b < nb; b += 32) {
-        device const uchar *blk = wr + b * 18;
-        float dd = (float)(*(device const half*)blk);
-        device const uchar *qs = blk + 2;
-        uint base = b * 32;
-        for (uint j = 0; j < 16; ++j) {
-            float x0 = (float)((int)(qs[j] & 0xF) - 8);
-            float x1 = (float)((int)(qs[j] >> 4) - 8);
-            sum += x0 * dd * x[base + j];
-            sum += x1 * dd * x[base + j + 16];
+    if (row < dim.d) {
+        uint nb = dim.n / 32;
+        device const uchar *wr = wb + (ulong)row * nb * 18;
+        for (uint b = lane; b < nb; b += GEMV_SG) {
+            device const uchar *blk = wr + b * 18;
+            float dd = (float)(*(device const half*)blk);
+            device const uchar *qs = blk + 2;
+            uint base = b * 32;
+            for (uint j = 0; j < 16; ++j) {
+                float w0 = (float)((int)(qs[j] & 0xF) - 8);
+                float w1 = (float)((int)(qs[j] >> 4) - 8);
+                sum += w0 * dd * x[base + j];
+                sum += w1 * dd * x[base + j + 16];
+            }
         }
     }
     sum = simd_sum(sum);
-    if (tid == 0) out[row] = sum;
+    if (lane == 0 && row < dim.d) out[row] = sum;
 }
 
 kernel void gemv_q4_1(device const uchar *wb [[buffer(0)]],
                       device const float *x  [[buffer(1)]],
                       device float *out      [[buffer(2)]],
                       constant Dims &dim     [[buffer(3)]],
-                      uint row [[threadgroup_position_in_grid]],
+                      uint tg [[threadgroup_position_in_grid]],
                       uint tid [[thread_position_in_threadgroup]]) {
-    if (row >= dim.d) return;
-    uint nb = dim.n / 32;
-    device const uchar *wr = wb + (ulong)row * nb * 20;
+    uint row = tg * GEMV_ROWS + tid / GEMV_SG;
+    uint lane = tid % GEMV_SG;
     float sum = 0.0;
-    for (uint b = tid; b < nb; b += 32) {
-        device const uchar *blk = wr + b * 20;
-        float dd = (float)(*(device const half*)blk);
-        float mm = (float)(*(device const half*)(blk + 2));
-        device const uchar *qs = blk + 4;
-        uint base = b * 32;
-        for (uint j = 0; j < 16; ++j) {
-            sum += ((float)(qs[j] & 0xF) * dd + mm) * x[base + j];
-            sum += ((float)(qs[j] >> 4)  * dd + mm) * x[base + j + 16];
+    if (row < dim.d) {
+        uint nb = dim.n / 32;
+        device const uchar *wr = wb + (ulong)row * nb * 20;
+        for (uint b = lane; b < nb; b += GEMV_SG) {
+            device const uchar *blk = wr + b * 20;
+            float dd = (float)(*(device const half*)blk);
+            float mm = (float)(*(device const half*)(blk + 2));
+            device const uchar *qs = blk + 4;
+            uint base = b * 32;
+            for (uint j = 0; j < 16; ++j) {
+                sum += ((float)(qs[j] & 0xF) * dd + mm) * x[base + j];
+                sum += ((float)(qs[j] >> 4)  * dd + mm) * x[base + j + 16];
+            }
         }
     }
     sum = simd_sum(sum);
-    if (tid == 0) out[row] = sum;
+    if (lane == 0 && row < dim.d) out[row] = sum;
 }
 
 kernel void gemv_q5_0(device const uchar *wb [[buffer(0)]],
                       device const float *x  [[buffer(1)]],
                       device float *out      [[buffer(2)]],
                       constant Dims &dim     [[buffer(3)]],
-                      uint row [[threadgroup_position_in_grid]],
+                      uint tg [[threadgroup_position_in_grid]],
                       uint tid [[thread_position_in_threadgroup]]) {
-    if (row >= dim.d) return;
-    uint nb = dim.n / 32;
-    device const uchar *wr = wb + (ulong)row * nb * 22;
+    uint row = tg * GEMV_ROWS + tid / GEMV_SG;
+    uint lane = tid % GEMV_SG;
     float sum = 0.0;
-    for (uint b = tid; b < nb; b += 32) {
-        device const uchar *blk = wr + b * 22;
-        float dd = (float)(*(device const half*)blk);
-        uint qh = (uint)blk[2] | ((uint)blk[3] << 8) | ((uint)blk[4] << 16) | ((uint)blk[5] << 24);
-        device const uchar *qs = blk + 6;
-        uint base = b * 32;
-        for (uint j = 0; j < 16; ++j) {
-            uchar xh0 = (uchar)((qh >> j) << 4) & 0x10;
-            uchar xh1 = (uchar)(qh >> (j + 12)) & 0x10;
-            float x0 = (float)((int)((qs[j] & 0xF) | xh0) - 16);
-            float x1 = (float)((int)((qs[j] >> 4)  | xh1) - 16);
-            sum += x0 * dd * x[base + j];
-            sum += x1 * dd * x[base + j + 16];
+    if (row < dim.d) {
+        uint nb = dim.n / 32;
+        device const uchar *wr = wb + (ulong)row * nb * 22;
+        for (uint b = lane; b < nb; b += GEMV_SG) {
+            device const uchar *blk = wr + b * 22;
+            float dd = (float)(*(device const half*)blk);
+            uint qh = (uint)blk[2] | ((uint)blk[3] << 8) | ((uint)blk[4] << 16) | ((uint)blk[5] << 24);
+            device const uchar *qs = blk + 6;
+            uint base = b * 32;
+            for (uint j = 0; j < 16; ++j) {
+                uchar xh0 = (uchar)((qh >> j) << 4) & 0x10;
+                uchar xh1 = (uchar)(qh >> (j + 12)) & 0x10;
+                float w0 = (float)((int)((qs[j] & 0xF) | xh0) - 16);
+                float w1 = (float)((int)((qs[j] >> 4)  | xh1) - 16);
+                sum += w0 * dd * x[base + j];
+                sum += w1 * dd * x[base + j + 16];
+            }
         }
     }
     sum = simd_sum(sum);
-    if (tid == 0) out[row] = sum;
+    if (lane == 0 && row < dim.d) out[row] = sum;
 }
 
 kernel void gemv_q5_1(device const uchar *wb [[buffer(0)]],
                       device const float *x  [[buffer(1)]],
                       device float *out      [[buffer(2)]],
                       constant Dims &dim     [[buffer(3)]],
-                      uint row [[threadgroup_position_in_grid]],
+                      uint tg [[threadgroup_position_in_grid]],
                       uint tid [[thread_position_in_threadgroup]]) {
-    if (row >= dim.d) return;
-    uint nb = dim.n / 32;
-    device const uchar *wr = wb + (ulong)row * nb * 24;
+    uint row = tg * GEMV_ROWS + tid / GEMV_SG;
+    uint lane = tid % GEMV_SG;
     float sum = 0.0;
-    for (uint b = tid; b < nb; b += 32) {
-        device const uchar *blk = wr + b * 24;
-        float dd = (float)(*(device const half*)blk);
-        float mm = (float)(*(device const half*)(blk + 2));
-        uint qh = (uint)blk[4] | ((uint)blk[5] << 8) | ((uint)blk[6] << 16) | ((uint)blk[7] << 24);
-        device const uchar *qs = blk + 8;
-        uint base = b * 32;
-        for (uint j = 0; j < 16; ++j) {
-            uchar xh0 = (uchar)((qh >> j) << 4) & 0x10;
-            uchar xh1 = (uchar)(qh >> (j + 12)) & 0x10;
-            float x0 = (float)((qs[j] & 0xF) | xh0);
-            float x1 = (float)((qs[j] >> 4)  | xh1);
-            sum += (x0 * dd + mm) * x[base + j];
-            sum += (x1 * dd + mm) * x[base + j + 16];
+    if (row < dim.d) {
+        uint nb = dim.n / 32;
+        device const uchar *wr = wb + (ulong)row * nb * 24;
+        for (uint b = lane; b < nb; b += GEMV_SG) {
+            device const uchar *blk = wr + b * 24;
+            float dd = (float)(*(device const half*)blk);
+            float mm = (float)(*(device const half*)(blk + 2));
+            uint qh = (uint)blk[4] | ((uint)blk[5] << 8) | ((uint)blk[6] << 16) | ((uint)blk[7] << 24);
+            device const uchar *qs = blk + 8;
+            uint base = b * 32;
+            for (uint j = 0; j < 16; ++j) {
+                uchar xh0 = (uchar)((qh >> j) << 4) & 0x10;
+                uchar xh1 = (uchar)(qh >> (j + 12)) & 0x10;
+                float w0 = (float)((qs[j] & 0xF) | xh0);
+                float w1 = (float)((qs[j] >> 4)  | xh1);
+                sum += (w0 * dd + mm) * x[base + j];
+                sum += (w1 * dd + mm) * x[base + j + 16];
+            }
         }
     }
     sum = simd_sum(sum);
-    if (tid == 0) out[row] = sum;
+    if (lane == 0 && row < dim.d) out[row] = sum;
 }
 
 kernel void gemv_q4_k(device const uchar *wb [[buffer(0)]],
                       device const float *x  [[buffer(1)]],
                       device float *out      [[buffer(2)]],
                       constant Dims &dim     [[buffer(3)]],
-                      uint row [[threadgroup_position_in_grid]],
+                      uint tg [[threadgroup_position_in_grid]],
                       uint tid [[thread_position_in_threadgroup]]) {
-    if (row >= dim.d) return;
-    uint nsb = dim.n / 256;
-    device const uchar *wr = wb + (ulong)row * nsb * 144;
+    uint row = tg * GEMV_ROWS + tid / GEMV_SG;
+    uint lane = tid % GEMV_SG;
     float sum = 0.0;
-    for (uint sb = tid; sb < nsb; sb += 32) {
-        device const uchar *blk = wr + sb * 144;
-        float dall = (float)(*(device const half*)blk);
-        float dmin = (float)(*(device const half*)(blk + 2));
-        device const uchar *scales = blk + 4;
-        device const uchar *qs = blk + 16;
-        uint ybase = sb * 256;
-        int is = 0;
-        uint qoff = 0;
-        for (uint j = 0; j < 256; j += 64) {
-            uchar sc, m;
-            get_scale_min_k4(is + 0, scales, sc, m);
-            float d1 = dall * sc, m1 = dmin * m;
-            get_scale_min_k4(is + 1, scales, sc, m);
-            float d2 = dall * sc, m2 = dmin * m;
-            for (uint l = 0; l < 32; ++l)
-                sum += (d1 * (float)(qs[qoff + l] & 0xF) - m1) * x[ybase + j + l];
-            for (uint l = 0; l < 32; ++l)
-                sum += (d2 * (float)(qs[qoff + l] >> 4) - m2) * x[ybase + j + 32 + l];
-            qoff += 32;
-            is += 2;
+    if (row < dim.d) {
+        uint nsb = dim.n / 256;
+        device const uchar *wr = wb + (ulong)row * nsb * 144;
+        for (uint sb = lane; sb < nsb; sb += GEMV_SG) {
+            device const uchar *blk = wr + sb * 144;
+            float dall = (float)(*(device const half*)blk);
+            float dmin = (float)(*(device const half*)(blk + 2));
+            device const uchar *scales = blk + 4;
+            device const uchar *qs = blk + 16;
+            uint ybase = sb * 256;
+            int is = 0;
+            uint qoff = 0;
+            for (uint j = 0; j < 256; j += 64) {
+                uchar sc, m;
+                get_scale_min_k4(is + 0, scales, sc, m);
+                float d1 = dall * sc, m1 = dmin * m;
+                get_scale_min_k4(is + 1, scales, sc, m);
+                float d2 = dall * sc, m2 = dmin * m;
+                for (uint l = 0; l < 32; ++l) {
+                    sum += (d1 * (float)(qs[qoff + l] & 0xF) - m1) * x[ybase + j + l];
+                    sum += (d2 * (float)(qs[qoff + l] >> 4) - m2) * x[ybase + j + 32 + l];
+                }
+                qoff += 32;
+                is += 2;
+            }
         }
     }
     sum = simd_sum(sum);
-    if (tid == 0) out[row] = sum;
+    if (lane == 0 && row < dim.d) out[row] = sum;
+}
+
+// Q6_K superblock dot: preloaded scales, float4 x strips, split l=0..15 / 16..31.
+inline float dot_q6_superblock(device const uchar *blk, device const float *x, uint ybase) {
+    device const uchar *ql = blk;
+    device const uchar *qh = blk + 128;
+    device const char  *sc = (device const char*)(blk + 192);
+    float dall = (float)(*(device const half*)(blk + 208));
+    float sum = 0.0;
+
+    for (int hf = 0; hf < 2; ++hf) {
+        uint qlo = hf * 64, qho = hf * 32, sco = hf * 8, yo = ybase + hf * 128;
+
+        float ds0 = dall * (float)sc[sco + 0];
+        float ds1 = dall * (float)sc[sco + 1];
+        float ds2 = dall * (float)sc[sco + 2];
+        float ds3 = dall * (float)sc[sco + 3];
+        float ds4 = dall * (float)sc[sco + 4];
+        float ds5 = dall * (float)sc[sco + 5];
+        float ds6 = dall * (float)sc[sco + 6];
+        float ds7 = dall * (float)sc[sco + 7];
+
+        for (int l = 0; l < 16; l += 4) {
+            float4 w1 = float4(
+                (float)((int)((ql[qlo+l+0] & 0xF) | (((qh[qho+l+0] >> 0) & 3) << 4)) - 32),
+                (float)((int)((ql[qlo+l+1] & 0xF) | (((qh[qho+l+1] >> 0) & 3) << 4)) - 32),
+                (float)((int)((ql[qlo+l+2] & 0xF) | (((qh[qho+l+2] >> 0) & 3) << 4)) - 32),
+                (float)((int)((ql[qlo+l+3] & 0xF) | (((qh[qho+l+3] >> 0) & 3) << 4)) - 32));
+            float4 w2 = float4(
+                (float)((int)((ql[qlo+l+32] & 0xF) | (((qh[qho+l+0] >> 2) & 3) << 4)) - 32),
+                (float)((int)((ql[qlo+l+33] & 0xF) | (((qh[qho+l+1] >> 2) & 3) << 4)) - 32),
+                (float)((int)((ql[qlo+l+34] & 0xF) | (((qh[qho+l+2] >> 2) & 3) << 4)) - 32),
+                (float)((int)((ql[qlo+l+35] & 0xF) | (((qh[qho+l+3] >> 2) & 3) << 4)) - 32));
+            float4 w3 = float4(
+                (float)((int)((ql[qlo+l+0] >> 4) | (((qh[qho+l+0] >> 4) & 3) << 4)) - 32),
+                (float)((int)((ql[qlo+l+1] >> 4) | (((qh[qho+l+1] >> 4) & 3) << 4)) - 32),
+                (float)((int)((ql[qlo+l+2] >> 4) | (((qh[qho+l+2] >> 4) & 3) << 4)) - 32),
+                (float)((int)((ql[qlo+l+3] >> 4) | (((qh[qho+l+3] >> 4) & 3) << 4)) - 32));
+            float4 w4 = float4(
+                (float)((int)((ql[qlo+l+32] >> 4) | (((qh[qho+l+0] >> 6) & 3) << 4)) - 32),
+                (float)((int)((ql[qlo+l+33] >> 4) | (((qh[qho+l+1] >> 6) & 3) << 4)) - 32),
+                (float)((int)((ql[qlo+l+34] >> 4) | (((qh[qho+l+2] >> 6) & 3) << 4)) - 32),
+                (float)((int)((ql[qlo+l+35] >> 4) | (((qh[qho+l+3] >> 6) & 3) << 4)) - 32));
+            float4 xv1 = float4(x[yo+l], x[yo+l+1], x[yo+l+2], x[yo+l+3]);
+            float4 xv2 = float4(x[yo+l+32], x[yo+l+33], x[yo+l+34], x[yo+l+35]);
+            float4 xv3 = float4(x[yo+l+64], x[yo+l+65], x[yo+l+66], x[yo+l+67]);
+            float4 xv4 = float4(x[yo+l+96], x[yo+l+97], x[yo+l+98], x[yo+l+99]);
+            sum += ds0 * dot(w1, xv1) + ds2 * dot(w2, xv2) + ds4 * dot(w3, xv3) + ds6 * dot(w4, xv4);
+        }
+        for (int l = 16; l < 32; l += 4) {
+            float4 w1 = float4(
+                (float)((int)((ql[qlo+l+0] & 0xF) | (((qh[qho+l+0] >> 0) & 3) << 4)) - 32),
+                (float)((int)((ql[qlo+l+1] & 0xF) | (((qh[qho+l+1] >> 0) & 3) << 4)) - 32),
+                (float)((int)((ql[qlo+l+2] & 0xF) | (((qh[qho+l+2] >> 0) & 3) << 4)) - 32),
+                (float)((int)((ql[qlo+l+3] & 0xF) | (((qh[qho+l+3] >> 0) & 3) << 4)) - 32));
+            float4 w2 = float4(
+                (float)((int)((ql[qlo+l+32] & 0xF) | (((qh[qho+l+0] >> 2) & 3) << 4)) - 32),
+                (float)((int)((ql[qlo+l+33] & 0xF) | (((qh[qho+l+1] >> 2) & 3) << 4)) - 32),
+                (float)((int)((ql[qlo+l+34] & 0xF) | (((qh[qho+l+2] >> 2) & 3) << 4)) - 32),
+                (float)((int)((ql[qlo+l+35] & 0xF) | (((qh[qho+l+3] >> 2) & 3) << 4)) - 32));
+            float4 w3 = float4(
+                (float)((int)((ql[qlo+l+0] >> 4) | (((qh[qho+l+0] >> 4) & 3) << 4)) - 32),
+                (float)((int)((ql[qlo+l+1] >> 4) | (((qh[qho+l+1] >> 4) & 3) << 4)) - 32),
+                (float)((int)((ql[qlo+l+2] >> 4) | (((qh[qho+l+2] >> 4) & 3) << 4)) - 32),
+                (float)((int)((ql[qlo+l+3] >> 4) | (((qh[qho+l+3] >> 4) & 3) << 4)) - 32));
+            float4 w4 = float4(
+                (float)((int)((ql[qlo+l+32] >> 4) | (((qh[qho+l+0] >> 6) & 3) << 4)) - 32),
+                (float)((int)((ql[qlo+l+33] >> 4) | (((qh[qho+l+1] >> 6) & 3) << 4)) - 32),
+                (float)((int)((ql[qlo+l+34] >> 4) | (((qh[qho+l+2] >> 6) & 3) << 4)) - 32),
+                (float)((int)((ql[qlo+l+35] >> 4) | (((qh[qho+l+3] >> 6) & 3) << 4)) - 32));
+            float4 xv1 = float4(x[yo+l], x[yo+l+1], x[yo+l+2], x[yo+l+3]);
+            float4 xv2 = float4(x[yo+l+32], x[yo+l+33], x[yo+l+34], x[yo+l+35]);
+            float4 xv3 = float4(x[yo+l+64], x[yo+l+65], x[yo+l+66], x[yo+l+67]);
+            float4 xv4 = float4(x[yo+l+96], x[yo+l+97], x[yo+l+98], x[yo+l+99]);
+            sum += ds1 * dot(w1, xv1) + ds3 * dot(w2, xv2) + ds5 * dot(w3, xv3) + ds7 * dot(w4, xv4);
+        }
+    }
+    return sum;
 }
 
 kernel void gemv_q6_k(device const uchar *wb [[buffer(0)]],
                       device const float *x  [[buffer(1)]],
                       device float *out      [[buffer(2)]],
                       constant Dims &dim     [[buffer(3)]],
-                      uint row [[threadgroup_position_in_grid]],
+                      uint tg [[threadgroup_position_in_grid]],
                       uint tid [[thread_position_in_threadgroup]]) {
-    if (row >= dim.d) return;
-    uint nsb = dim.n / 256;
-    device const uchar *wr = wb + (ulong)row * nsb * 210;
+    uint row = tg * GEMV_ROWS + tid / GEMV_SG;
+    uint lane = tid % GEMV_SG;
     float sum = 0.0;
-    for (uint sb = tid; sb < nsb; sb += 32) {
-        device const uchar *blk = wr + sb * 210;
-        device const uchar *ql = blk;
-        device const uchar *qh = blk + 128;
-        device const char  *sc = (device const char*)(blk + 192);
-        float dall = (float)(*(device const half*)(blk + 208));
-        uint ybase = sb * 256;
-        for (int hf = 0; hf < 2; ++hf) {
-            uint qlo = hf * 64, qho = hf * 32, sco = hf * 8, yo = ybase + hf * 128;
-            for (int l = 0; l < 32; ++l) {
-                int isc = l / 16;
-                int q1 = (int)((ql[qlo + l]      & 0xF) | (((qh[qho + l] >> 0) & 3) << 4)) - 32;
-                int q2 = (int)((ql[qlo + l + 32] & 0xF) | (((qh[qho + l] >> 2) & 3) << 4)) - 32;
-                int q3 = (int)((ql[qlo + l]      >> 4)  | (((qh[qho + l] >> 4) & 3) << 4)) - 32;
-                int q4 = (int)((ql[qlo + l + 32] >> 4)  | (((qh[qho + l] >> 6) & 3) << 4)) - 32;
-                sum += dall * (float)sc[sco + isc + 0] * (float)q1 * x[yo + l];
-                sum += dall * (float)sc[sco + isc + 2] * (float)q2 * x[yo + l + 32];
-                sum += dall * (float)sc[sco + isc + 4] * (float)q3 * x[yo + l + 64];
-                sum += dall * (float)sc[sco + isc + 6] * (float)q4 * x[yo + l + 96];
-            }
-        }
+    if (row < dim.d) {
+        uint nsb = dim.n / 256;
+        device const uchar *wr = wb + (ulong)row * nsb * 210;
+        for (uint sb = lane; sb < nsb; sb += GEMV_SG)
+            sum += dot_q6_superblock(wr + sb * 210, x, sb * 256);
     }
     sum = simd_sum(sum);
-    if (tid == 0) out[row] = sum;
+    if (lane == 0 && row < dim.d) out[row] = sum;
 }
 
 // ---- Stage B elementwise / attention kernels ----
 
 struct NormP { uint size; float eps; };
 struct RopeP { uint head_dim; uint pos; float rope_freq; };
-struct AttnP { uint head_dim; uint kv_dim; uint kv_mul; uint pos; uint seq_len; };
+struct AttnP { uint head_dim; uint seq_len; uint kv_mul; uint pos; };
+struct StoreP { uint head_dim; uint seq_len; uint pos; };
 
 // One threadgroup (32 lanes) per vector; grp selects the vector slice.
 kernel void rmsnorm(device const float *inp [[buffer(0)]],
@@ -334,62 +436,77 @@ kernel void rope(device float *vec   [[buffer(0)]],
     q[i + half_d] = x0 * s + y0 * c;
 }
 
-// One threadgroup (128 lanes) per head. kc/vc are bound at the layer base.
+// Store current-position K/V (f32, contiguous per kv-head) into the cache as
+// f16, head-major: [kv_head][seq][head_dim] (kc/vc bound at the layer base).
+kernel void store_kv(device const float *ktmp [[buffer(0)]],
+                     device const float *vtmp [[buffer(1)]],
+                     device half *kc          [[buffer(2)]],
+                     device half *vc          [[buffer(3)]],
+                     constant StoreP &P       [[buffer(4)]],
+                     uint gid [[thread_position_in_grid]]) {
+    uint kvh = gid / P.head_dim;
+    uint i = gid % P.head_dim;
+    ulong dst = ((ulong)kvh * P.seq_len + P.pos) * P.head_dim + i;
+    kc[dst] = (half)ktmp[gid];
+    vc[dst] = (half)vtmp[gid];
+}
+
+// One threadgroup (128 lanes) per query head. kc/vc are f16, head-major,
+// bound at the layer base. Scores live in threadgroup memory (no global att).
 kernel void attention(device const float *q   [[buffer(0)]],
-                      device const float *kc  [[buffer(1)]],
-                      device const float *vc  [[buffer(2)]],
-                      device float *att       [[buffer(3)]],
-                      device float *xb3       [[buffer(4)]],
-                      constant AttnP &P       [[buffer(5)]],
+                      device const half  *kc  [[buffer(1)]],
+                      device const half  *vc  [[buffer(2)]],
+                      device float *xb3       [[buffer(3)]],
+                      constant AttnP &P       [[buffer(4)]],
+                      threadgroup float *scores [[threadgroup(0)]],
                       uint h   [[threadgroup_position_in_grid]],
                       uint tid [[thread_position_in_threadgroup]]) {
     const uint NT = 128;
-    threadgroup float tmp[NT];
+    threadgroup float red[NT];
     device const float *qh = q + (ulong)h * P.head_dim;
-    device float *atth = att + (ulong)h * P.seq_len;
     uint kvh = h / P.kv_mul;
+    device const half *kbase = kc + (ulong)kvh * P.seq_len * P.head_dim;
+    device const half *vbase = vc + (ulong)kvh * P.seq_len * P.head_dim;
     float scale = rsqrt((float)P.head_dim);
+    uint n = P.pos + 1;
 
-    for (uint t = tid; t <= P.pos; t += NT) {
-        device const float *k = kc + (ulong)t * P.kv_dim + (ulong)kvh * P.head_dim;
+    for (uint t = tid; t < n; t += NT) {
+        device const half *k = kbase + (ulong)t * P.head_dim;
         float s = 0.0;
-        for (uint i = 0; i < P.head_dim; ++i) s += qh[i] * k[i];
-        atth[t] = s * scale;
+        for (uint i = 0; i < P.head_dim; ++i) s += qh[i] * (float)k[i];
+        scores[t] = s * scale;
     }
-    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     float lm = -INFINITY;
-    for (uint t = tid; t <= P.pos; t += NT) lm = max(lm, atth[t]);
-    tmp[tid] = lm;
+    for (uint t = tid; t < n; t += NT) lm = max(lm, scores[t]);
+    red[tid] = lm;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint s = NT / 2; s > 0; s >>= 1) {
-        if (tid < s) tmp[tid] = max(tmp[tid], tmp[tid + s]);
+        if (tid < s) red[tid] = max(red[tid], red[tid + s]);
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    float m = tmp[0];
+    float m = red[0];
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     float ls = 0.0;
-    for (uint t = tid; t <= P.pos; t += NT) {
-        float e = exp(atth[t] - m);
-        atth[t] = e;
+    for (uint t = tid; t < n; t += NT) {
+        float e = exp(scores[t] - m);
+        scores[t] = e;
         ls += e;
     }
-    tmp[tid] = ls;
-    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+    red[tid] = ls;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint s = NT / 2; s > 0; s >>= 1) {
-        if (tid < s) tmp[tid] = tmp[tid] + tmp[tid + s];
+        if (tid < s) red[tid] = red[tid] + red[tid + s];
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    float inv = 1.0 / tmp[0];
+    float inv = 1.0 / red[0];
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     for (uint i = tid; i < P.head_dim; i += NT) {
         float acc = 0.0;
-        for (uint t = 0; t <= P.pos; ++t) {
-            device const float *v = vc + (ulong)t * P.kv_dim + (ulong)kvh * P.head_dim;
-            acc += atth[t] * v[i];
-        }
+        for (uint t = 0; t < n; ++t) acc += scores[t] * (float)vbase[(ulong)t * P.head_dim + i];
         xb3[(ulong)h * P.head_dim + i] = acc * inv;
     }
 }
@@ -432,6 +549,11 @@ new_shared :: proc(n_floats: int) -> ^MTL.Buffer {
 	return m_device->newBufferWithLength(NS.UInteger(n_floats * size_of(f32)), MTL.ResourceStorageModeShared)
 }
 
+@(private = "file")
+new_shared_bytes :: proc(n_bytes: int) -> ^MTL.Buffer {
+	return m_device->newBufferWithLength(NS.UInteger(n_bytes), MTL.ResourceStorageModeShared)
+}
+
 metal_init :: proc(t: ^Transformer) -> bool {
 	g := &t.gguf
 	c := t.config
@@ -469,6 +591,7 @@ metal_init :: proc(t: ^Transformer) -> bool {
 	m_pso_attn = make_pso(lib, "attention")
 	m_pso_swiglu = make_pso(lib, "swiglu")
 	m_pso_residual = make_pso(lib, "residual")
+	m_pso_store_kv = make_pso(lib, "store_kv")
 
 	// Zero-copy wrap the mmap'd weights. Length rounded up to a page (the
 	// mapping already covers whole pages, so the extra bytes are valid).
@@ -492,10 +615,13 @@ metal_init :: proc(t: ^Transformer) -> bool {
 	m_b_q = new_shared(att_head_dim)
 	m_b_hb = new_shared(c.hidden_dim)
 	m_b_hb2 = new_shared(c.hidden_dim)
-	m_b_att = new_shared(c.n_heads * c.seq_len)
+	m_b_ktmp = new_shared(kv_dim)
+	m_b_vtmp = new_shared(kv_dim)
 	m_b_logits = new_shared(c.vocab_size)
-	m_b_kc = new_shared(c.n_layers * c.seq_len * kv_dim)
-	m_b_vc = new_shared(c.n_layers * c.seq_len * kv_dim)
+	// KV cache: f16 (2 bytes/elem), same element count as before.
+	kv_elems := c.n_layers * c.seq_len * kv_dim
+	m_b_kc = new_shared_bytes(kv_elems * 2)
+	m_b_vc = new_shared_bytes(kv_elems * 2)
 
 	metal_enabled = true
 	return true
@@ -503,7 +629,7 @@ metal_init :: proc(t: ^Transformer) -> bool {
 
 metal_destroy :: proc() {
 	if !metal_enabled do return
-	for b in ([]^MTL.Buffer{m_b_x, m_b_xb, m_b_xb2, m_b_xb3, m_b_q, m_b_hb, m_b_hb2, m_b_att, m_b_logits, m_b_kc, m_b_vc}) {
+	for b in ([]^MTL.Buffer{m_b_x, m_b_xb, m_b_xb2, m_b_xb3, m_b_q, m_b_hb, m_b_hb2, m_b_ktmp, m_b_vtmp, m_b_logits, m_b_kc, m_b_vc}) {
 		b->release()
 	}
 	m_weights->release()
@@ -565,7 +691,8 @@ enc_gemv :: proc(
 	enc->setBuffer(ob, o_off, 2)
 	dims := [2]u32{u32(n), u32(d)}
 	enc->setBytes(bytes_of(&dims, size_of(dims)), 3)
-	enc->dispatchThreadgroups(MTL.Size{NS.Integer(d), 1, 1}, MTL.Size{32, 1, 1})
+	tg_x := (d + GEMV_ROWS - 1) / GEMV_ROWS
+	enc->dispatchThreadgroups(MTL.Size{NS.Integer(tg_x), 1, 1}, MTL.Size{GEMV_TG, 1, 1})
 }
 
 @(private = "file")
@@ -639,68 +766,72 @@ forward_gpu :: proc(transformer: ^Transformer, token: int, pos: int) -> []f32 {
 	cmd := m_queue->commandBuffer()
 	enc := cmd->computeCommandEncoder()
 
+	// f16 KV cache layer stride in bytes (head-major: [kv_head][seq][head_dim]).
+	kv_layer_bytes := seq_len * kv_dim * 2
+
 	for l in 0 ..< p.n_layers {
 		lw := &w.layers[l]
-		loff_bytes := NS.UInteger(l * seq_len * kv_dim * size_of(f32))
-		k_off := loff_bytes + NS.UInteger(pos * kv_dim * size_of(f32))
+		kv_loff := NS.UInteger(l * kv_layer_bytes)
 
 		enc_rmsnorm(enc, m_b_x, m_b_xb, raw_data(lw.attn_norm), dim, 1, eps)
 
 		enc_gemv(enc, lw.wq.kind, woff(raw_data(lw.wq.data)), m_b_xb, 0, m_b_q, 0, dim, att_head_dim)
-		enc_gemv(enc, lw.wk.kind, woff(raw_data(lw.wk.data)), m_b_xb, 0, m_b_kc, k_off, dim, kv_dim)
-		enc_gemv(enc, lw.wv.kind, woff(raw_data(lw.wv.data)), m_b_xb, 0, m_b_vc, k_off, dim, kv_dim)
+		enc_gemv(enc, lw.wk.kind, woff(raw_data(lw.wk.data)), m_b_xb, 0, m_b_ktmp, 0, dim, kv_dim)
+		enc_gemv(enc, lw.wv.kind, woff(raw_data(lw.wv.data)), m_b_xb, 0, m_b_vtmp, 0, dim, kv_dim)
 
-		// Per-head Q/K RMSNorm (in place), then RoPE.
+		// Per-head Q/K RMSNorm, then RoPE (K on the contiguous f32 temp).
 		enc_rmsnorm(enc, m_b_q, m_b_q, raw_data(lw.q_norm), head_dim, n_heads, eps)
-		enc->setComputePipelineState(m_pso_rmsnorm)
-		enc->setBuffer(m_b_kc, k_off, 0)
-		enc->setBuffer(m_b_kc, k_off, 1)
-		enc->setBuffer(m_weights, woff(raw_data(lw.k_norm)), 2)
-		{
-			P := struct {
-				size: u32,
-				eps:  f32,
-			}{u32(head_dim), eps}
-			enc->setBytes(bytes_of(&P, size_of(P)), 3)
-		}
-		enc->dispatchThreadgroups(MTL.Size{NS.Integer(n_kv_heads), 1, 1}, MTL.Size{32, 1, 1})
+		enc_rmsnorm(enc, m_b_ktmp, m_b_ktmp, raw_data(lw.k_norm), head_dim, n_kv_heads, eps)
 
-		// RoPE on q (n_heads) and k (n_kv_heads).
-		rope_q := struct {
+		rope_p := struct {
 			head_dim:  u32,
 			pos:       u32,
 			rope_freq: f32,
 		}{u32(head_dim), u32(pos), p.rope_freq}
 		enc->setComputePipelineState(m_pso_rope)
 		enc->setBuffer(m_b_q, 0, 0)
-		enc->setBytes(bytes_of(&rope_q, size_of(rope_q)), 1)
+		enc->setBytes(bytes_of(&rope_p, size_of(rope_p)), 1)
 		enc->dispatchThreads(
 			MTL.Size{NS.Integer(n_heads * head_dim / 2), 1, 1},
 			MTL.Size{NS.Integer(min(head_dim / 2, 64)), 1, 1},
 		)
 		enc->setComputePipelineState(m_pso_rope)
-		enc->setBuffer(m_b_kc, k_off, 0)
-		enc->setBytes(bytes_of(&rope_q, size_of(rope_q)), 1)
+		enc->setBuffer(m_b_ktmp, 0, 0)
+		enc->setBytes(bytes_of(&rope_p, size_of(rope_p)), 1)
 		enc->dispatchThreads(
 			MTL.Size{NS.Integer(n_kv_heads * head_dim / 2), 1, 1},
 			MTL.Size{NS.Integer(min(head_dim / 2, 64)), 1, 1},
 		)
 
-		// Attention: one threadgroup of 128 lanes per head.
+		// Store K/V into the cache as f16, head-major.
+		enc->setComputePipelineState(m_pso_store_kv)
+		enc->setBuffer(m_b_ktmp, 0, 0)
+		enc->setBuffer(m_b_vtmp, 0, 1)
+		enc->setBuffer(m_b_kc, kv_loff, 2)
+		enc->setBuffer(m_b_vc, kv_loff, 3)
+		store_p := struct {
+			head_dim: u32,
+			seq_len:  u32,
+			pos:      u32,
+		}{u32(head_dim), u32(seq_len), u32(pos)}
+		enc->setBytes(bytes_of(&store_p, size_of(store_p)), 4)
+		enc->dispatchThreads(MTL.Size{NS.Integer(kv_dim), 1, 1}, MTL.Size{NS.Integer(min(kv_dim, 256)), 1, 1})
+
+		// Attention: one threadgroup of 128 lanes per query head; scores in
+		// threadgroup memory (sized to the current sequence length).
 		enc->setComputePipelineState(m_pso_attn)
 		enc->setBuffer(m_b_q, 0, 0)
-		enc->setBuffer(m_b_kc, loff_bytes, 1)
-		enc->setBuffer(m_b_vc, loff_bytes, 2)
-		enc->setBuffer(m_b_att, 0, 3)
-		enc->setBuffer(m_b_xb3, 0, 4)
+		enc->setBuffer(m_b_kc, kv_loff, 1)
+		enc->setBuffer(m_b_vc, kv_loff, 2)
+		enc->setBuffer(m_b_xb3, 0, 3)
 		attn_p := struct {
 			head_dim: u32,
-			kv_dim:   u32,
+			seq_len:  u32,
 			kv_mul:   u32,
 			pos:      u32,
-			seq_len:  u32,
-		}{u32(head_dim), u32(kv_dim), u32(kv_mul), u32(pos), u32(seq_len)}
-		enc->setBytes(bytes_of(&attn_p, size_of(attn_p)), 5)
+		}{u32(head_dim), u32(seq_len), u32(kv_mul), u32(pos)}
+		enc->setBytes(bytes_of(&attn_p, size_of(attn_p)), 4)
+		enc->setThreadgroupMemoryLength(NS.UInteger((pos + 1) * size_of(f32)), 0)
 		enc->dispatchThreadgroups(MTL.Size{NS.Integer(n_heads), 1, 1}, MTL.Size{128, 1, 1})
 
 		enc_gemv(enc, lw.wo.kind, woff(raw_data(lw.wo.data)), m_b_xb3, 0, m_b_xb2, 0, att_head_dim, dim)
