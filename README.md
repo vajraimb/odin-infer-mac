@@ -163,23 +163,19 @@ Qwen3-8B Q4_K_M, M3 Air 16 GB, `-g 1 -c 1024`:
 
 ## Build from source
 
-Requires [Odin](https://odin-lang.org/) (2026-06+):
+Requires [Odin](https://odin-lang.org/) (2026-06+) and the
+[odin-infer](https://github.com/vajraimb/odin-infer) library as a sibling directory:
 
 ```sh
+git clone https://github.com/vajraimb/odin-infer.git ../odin-infer
 git clone https://github.com/vajraimb/odin-infer-mac.git
 cd odin-infer-mac
 ./build.sh
-# -> ./odin-infer-mac  (~3.5 MB, tokenizer embedded via #load)
+# -> ./odin-infer-mac  (~3.5 MB, tokenizer embedded via #load in library)
 ```
 
-Manual build:
-
-```sh
-odin build . -out:odin-infer-mac -o:speed -no-bounds-check -disable-assert -microarch:native
-```
-
-The tokenizer is embedded at compile time. Placing `vocab.txt` / `merges.txt` in
-the working directory overrides the embedded copy (for development).
+The inference engine lives in **odin-infer**; this repo is CLI-only (`main.odin`).
+The tokenizer vocab/merges are embedded at compile time in the library.
 
 ---
 
@@ -195,8 +191,10 @@ the working directory overrides the embedded copy (for development).
 
 ## Test
 
+Tokenizer tests run from the library:
+
 ```sh
-odin test .
+cd ../odin-infer && ./build.sh
 ```
 
 ---
@@ -205,14 +203,8 @@ odin test .
 
 | File | Purpose |
 |------|---------|
-| `gguf.odin` | GGUF binary parser |
-| `quant.odin` | GGML dequant + SIMD dots |
-| `model.odin` | Config, weights, run state |
-| `forward.odin` | CPU forward pass |
-| `matmul.odin` | CPU multithreaded GEMV |
-| `metal.odin` | Metal MSL kernels + GPU forward |
-| `tokenizer.odin` | BPE tokenizer (embedded vocab) |
-| `sampler.odin` | Temperature / top-p sampling |
 | `main.odin` | CLI + chat loop |
-| `build.sh` | Release build script |
+| `build.sh` | Release build (links `../odin-infer` via `-collection`) |
 | `odin-infer-mac` | Pre-built Apple Silicon binary (committed for download) |
+
+Engine, tokenizer, sampler, and GGUF code: **[odin-infer](https://github.com/vajraimb/odin-infer)** repo.

@@ -2,6 +2,11 @@
 
 package main
 
+import ggml "ggml:ggml"
+import infer "infer:infer"
+import sampler "sampler:sampler"
+import tokenizer "tokenizer:tokenizer"
+
 import "core:fmt"
 import "core:os"
 import "core:strconv"
@@ -34,14 +39,14 @@ read_stdin :: proc(guide: string, buffer: ^[8192]u8) -> string {
 }
 
 chat :: proc(
-	transformer: ^Transformer,
-	tokenizer: ^Tokenizer,
-	sampler: ^Sampler,
+	engine: ^infer.Engine,
+	tok: ^tokenizer.Tokenizer,
+	samp: ^sampler.Sampler,
 	think_on: bool,
 	multi_turn: bool,
 	tps: bool,
 	ttft: bool,
-	tb: ^Token_Buffer,
+	tb: ^tokenizer.Token_Buffer,
 ) {
 	system_buf: [8192]u8
 	user_buf: [8192]u8
@@ -54,6 +59,7 @@ chat :: proc(
 		delete(prompt_tokens)
 	}
 
+	cfg := infer.engine_config(engine)
 	user_turn := true
 	next: int
 	pos := 0
@@ -93,7 +99,7 @@ chat :: proc(
 				rendered = fmt.tprintf("%s<think>\n\n</think>\n", rendered)
 			}
 
-			encoded, err := encode(tokenizer, rendered)
+			encoded, err := tokenizer.encode(tok, rendered)
 			if err != nil {
 				fmt.eprintf("encode failed: %v\n", err)
 				break
@@ -111,7 +117,7 @@ chat :: proc(
 			clear(&prompt_tokens)
 			append(&prompt_tokens, ..encoded)
 
-			max_ctx := transformer.config.seq_len
+			max_ctx := cfg.seq_len
 			if len(prompt_tokens) >= max_ctx {
 				fmt.fprintf(
 					os.stderr,
@@ -126,7 +132,7 @@ chat :: proc(
 			user_turn = false
 
 			if multi_turn {
-				append_tokens(tb, encoded)
+				tokenizer.append_tokens(tb, encoded)
 				num_prompt_tokens = len(tb.data)
 			} else {
 				num_prompt_tokens = len(prompt_tokens)
@@ -144,7 +150,7 @@ chat :: proc(
 			token = next
 		}
 
-		if pos >= transformer.config.seq_len {
+		if pos >= cfg.seq_len {
 			fmt.fprintln(os.stderr, "\nContext limit reached; stopping generation.")
 			fmt.println()
 			user_turn = true
@@ -164,13 +170,8 @@ chat :: proc(
 			continue
 		}
 
-		logits: []f32
-		when ODIN_OS == .Darwin {
-			logits = metal_enabled ? forward_gpu(transformer, token, pos) : forward(transformer, token, pos)
-		} else {
-			logits = forward(transformer, token, pos)
-		}
-		next = sample(sampler, logits)
+		logits := infer.engine_forward(engine, token, pos)
+		next = sampler.sample(samp, logits)
 		if debug_tokens && pos < num_prompt_tokens + 3 {
 			fmt.fprintf(os.stderr, "[dbg pos=%d tok=%d -> next=%d l0=%.3f]\n", pos, token, next, logits[0])
 		}
@@ -178,7 +179,7 @@ chat :: proc(
 
 		if pos >= num_prompt_tokens {
 			if multi_turn {
-				append_tokens(tb, []int{next})
+				tokenizer.append_tokens(tb, []int{next})
 				num_prompt_tokens = len(tb.data)
 			}
 
@@ -200,7 +201,7 @@ chat :: proc(
 					t_ttft = 0
 				}
 			} else {
-				decoded := decode_token_id(tokenizer, next)
+				decoded := tokenizer.decode_token_id(tok, next)
 				if len(decoded) > 0 {
 					fmt.print(decoded)
 					os.flush(os.stdout)
@@ -221,17 +222,17 @@ chat :: proc(
 }
 
 dump_gguf :: proc(path: string) {
-	g: GGUF_File
-	parse_gguf(path, &g)
-	defer free_gguf(&g)
+	g: ggml.GGUF_File
+	ggml.parse_gguf(path, &g)
+	defer ggml.free_gguf(&g)
 
 	fmt.printf("tensors=%d metadata=%d\n", len(g.tensors), len(g.metadata))
-	counts: map[GGML_Type]int
+	counts: map[ggml.GGML_Type]int
 	defer delete(counts)
 	for &t in g.tensors {counts[t.kind] += 1}
 	fmt.printf("type histogram: %v\n", counts)
 	for name in ([]string{"token_embd.weight", "blk.0.ffn_gate.weight", "blk.0.attn_q.weight", "blk.0.ffn_down.weight"}) {
-		if t, ok := gguf_get_tensor(&g, name); ok {
+		if t, ok := ggml.gguf_get_tensor(&g, name); ok {
 			fmt.printf(
 				"%-24s kind=%v dims=%v offset=%d bytes=%d\n",
 				name,
@@ -245,7 +246,7 @@ dump_gguf :: proc(path: string) {
 			row_n := int(t.dims[0])
 			scratch := make([]f32, row_n)
 			defer delete(scratch)
-			dequant_row(t.kind, t.data, row_n, scratch)
+			ggml.dequant_row(t.kind, t.data, row_n, scratch)
 			fmt.printf("  row0[0:8] =")
 			for i in 0 ..< 8 {fmt.printf(" %.5f", scratch[i])}
 			fmt.printf("\n")
@@ -282,7 +283,7 @@ main :: proc() {
 	tps := false
 	ttft := false
 	num_threads := os.get_processor_core_count()
-	max_ctx := DEFAULT_MAX_CONTEXT
+	max_ctx := infer.DEFAULT_MAX_CONTEXT
 	use_metal := false
 
 	args := os.args
@@ -344,40 +345,30 @@ main :: proc() {
 	}
 	if temperature < 0 do temperature = 0
 	if topp < 0 || topp > 1 do topp = 0.9
-	matmul_num_threads = max(num_threads, 1)
 
-	transformer: Transformer
-	build_transformer(&transformer, checkpoint_path, max_ctx)
-	defer free_transformer(&transformer)
+	engine, _ := infer.engine_load(checkpoint_path, infer.Engine_Opts{
+		max_ctx     = max_ctx,
+		use_metal   = use_metal,
+		num_threads = num_threads,
+	})
+	defer infer.engine_destroy(&engine)
 
-	if use_metal {
-		when ODIN_OS == .Darwin {
-			if !metal_init(&transformer) {
-				fmt.eprintln("metal: init failed, falling back to CPU")
-			}
-		} else {
-			fmt.eprintln("metal: only supported on macOS; using CPU")
-		}
-	}
-	when ODIN_OS == .Darwin {
-		defer metal_destroy()
-	}
-
-	tokenizer: Tokenizer
-	build_tokenizer(&tokenizer)
-	defer free_tokenizer(&tokenizer)
-	if !verify_tokenizer(&tokenizer) {
+	tok: tokenizer.Tokenizer
+	tokenizer.build_tokenizer(&tok)
+	defer tokenizer.free_tokenizer(&tok)
+	if !tokenizer.verify_tokenizer(&tok) {
 		fmt.eprintln("Tokenizer self-check failed.")
 		os.exit(1)
 	}
 
-	tb: Token_Buffer
-	build_token_buffer(&tb)
-	defer free_token_buffer(&tb)
+	tb: tokenizer.Token_Buffer
+	tokenizer.build_token_buffer(&tb)
+	defer tokenizer.free_token_buffer(&tb)
 
-	sampler: Sampler
-	build_sampler(&sampler, int(transformer.config.vocab_size), temperature, topp, rng_seed)
-	defer free_sampler(&sampler)
+	samp: sampler.Sampler
+	cfg := infer.engine_config(&engine)
+	sampler.build_sampler(&samp, int(cfg.vocab_size), temperature, topp, rng_seed)
+	defer sampler.free_sampler(&samp)
 
 	fmt.printf(
 		"Multi-turn = %s, thinKing = %s, tps(R) = %s, ttFt = %s, threads = %d, Temperature = %.2f, top-P = %.2f\n",
@@ -391,7 +382,7 @@ main :: proc() {
 	)
 	fmt.println("Press Enter to exit the chat")
 
-	chat(&transformer, &tokenizer, &sampler, think_on, multi_turn, tps, ttft, &tb)
+	chat(&engine, &tok, &samp, think_on, multi_turn, tps, ttft, &tb)
 
-	destroy_matmul_pool()
+	infer.destroy_matmul_pool()
 }
