@@ -1,11 +1,15 @@
-/* CLI and chat loop for Qwen3 Odin inference */
+/* CLI and chat loop. Auto-detects Qwen3 vs Qwen3.5 (Ornith) from the GGUF and
+   dispatches to the matching engine + tokenizer. `-g 1` enables Metal on Apple
+   Silicon (both architectures). `-x` sets repetition penalty (off by default). */
 
 package main
 
 import ggml "ggml:ggml"
 import infer "infer:infer"
+import q35 "qwen3_5:qwen3_5"
 import sampler "sampler:sampler"
 import tokenizer "tokenizer:tokenizer"
+import tok35 "qwen3_5_tokenizer:qwen3_5_tokenizer"
 
 import "core:fmt"
 import "core:os"
@@ -13,9 +17,12 @@ import "core:strconv"
 import "core:strings"
 import "core:time"
 
-EOS_TOKEN_ID :: 151645
+EOS_QWEN3   :: 151645  // <|im_end|>
+EOS_QWEN3_5 :: 248046  // <|im_end|>
 
 debug_tokens: bool
+
+Model_Kind :: enum { Qwen3, Qwen3_5 }
 
 time_in_ms :: proc() -> i64 {
 	return time.to_unix_nanoseconds(time.now()) / 1_000_000
@@ -38,14 +45,26 @@ read_stdin :: proc(guide: string, buffer: ^[8192]u8) -> string {
 	return result
 }
 
-chat :: proc(
+// ---- architecture detection (peek the GGUF metadata before loading) ----
+detect_arch :: proc(path: string) -> Model_Kind {
+	g: ggml.GGUF_File
+	ggml.parse_gguf(path, &g)
+	defer ggml.free_gguf(&g)
+	arch, _ := ggml.gguf_meta_str(&g, "general.architecture")
+	switch arch {
+	case "qwen35", "qwen3_5", "qwen3.5", "qwen3_5_text":
+		return .Qwen3_5
+	}
+	return .Qwen3
+}
+
+// ============================ Qwen3 chat loop ============================
+chat_q3 :: proc(
 	engine: ^infer.Engine,
 	tok: ^tokenizer.Tokenizer,
 	samp: ^sampler.Sampler,
-	think_on: bool,
-	multi_turn: bool,
-	tps: bool,
-	ttft: bool,
+	think_on, multi_turn, tps, ttft: bool,
+	rep_penalty: f32,
 	tb: ^tokenizer.Token_Buffer,
 ) {
 	system_buf: [8192]u8
@@ -77,67 +96,42 @@ chat :: proc(
 			user_prompt = read_stdin("Q: ", &user_buf)
 			if len(user_prompt) == 0 do break
 
-			if ttft && timer2 == -1 {
-				timer2 = time_in_ms()
-			}
+			if ttft && timer2 == -1 { timer2 = time_in_ms() }
 
 			rendered: string
 			if pos == 0 && len(system_prompt) > 0 {
 				rendered = fmt.tprintf(
 					"<|im_start|>system\n%s<|im_end|>\n<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n",
-					system_prompt,
-					user_prompt,
-				)
+					system_prompt, user_prompt)
 			} else {
-				rendered = fmt.tprintf(
-					"<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n",
-					user_prompt,
-				)
+				rendered = fmt.tprintf("<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n", user_prompt)
 			}
-
 			if !think_on {
 				rendered = fmt.tprintf("%s<think>\n\n</think>\n", rendered)
 			}
 
 			encoded, err := tokenizer.encode(tok, rendered)
-			if err != nil {
-				fmt.eprintf("encode failed: %v\n", err)
-				break
-			}
-			for id in encoded {
-				if id == 0 {
-					fmt.fprintln(
-						os.stderr,
-						"Warning: some prompt text could not be tokenized.",
-					)
-					break
-				}
-			}
-
+			if err != nil { fmt.eprintf("encode failed: %v\n", err); break }
 			clear(&prompt_tokens)
 			append(&prompt_tokens, ..encoded)
+			if rep_penalty > 1.0 {
+				for id in encoded { sampler.record_token(samp, id) }
+			}
 
 			max_ctx := cfg.seq_len
 			if len(prompt_tokens) >= max_ctx {
-				fmt.fprintf(
-					os.stderr,
-					"Prompt is %d tokens but context limit is %d; truncating prompt.\n",
-					len(prompt_tokens),
-					max_ctx,
-				)
+				fmt.fprintf(os.stderr, "Prompt is %d tokens but context limit is %d; truncating.\n", len(prompt_tokens), max_ctx)
 				resize(&prompt_tokens, max_ctx - 1)
 			}
 
 			pos = 0
 			user_turn = false
-
 			if multi_turn {
 				tokenizer.append_tokens(tb, encoded)
 				num_prompt_tokens = len(tb.data)
 			} else {
 				num_prompt_tokens = len(prompt_tokens)
 			}
-
 			fmt.fprintf(os.stderr, "Prefilling %d tokens...\n", num_prompt_tokens)
 			fmt.print("A: ")
 			os.flush(os.stdout)
@@ -156,25 +150,14 @@ chat :: proc(
 			user_turn = true
 			if tps && timer >= 0 {
 				elapsed := f64(time_in_ms()) - timer
-				if elapsed > 0 {
-					fmt.eprintf("tok/s: %f\n", f64(count) / elapsed * 1000.0)
-				}
-				timer = -1
-				count = 0
-			}
-			if ttft && t_ttft > 0 {
-				fmt.eprintf("TTFT: %d ms\n", t_ttft)
-				timer2 = -1
-				t_ttft = 0
+				if elapsed > 0 { fmt.eprintf("tok/s: %f\n", f64(count) / elapsed * 1000.0) }
+				timer = -1; count = 0
 			}
 			continue
 		}
 
 		logits := infer.engine_forward(engine, token, pos)
 		next = sampler.sample(samp, logits)
-		if debug_tokens && pos < num_prompt_tokens + 3 {
-			fmt.fprintf(os.stderr, "[dbg pos=%d tok=%d -> next=%d l0=%.3f]\n", pos, token, next, logits[0])
-		}
 		pos += 1
 
 		if pos >= num_prompt_tokens {
@@ -182,39 +165,155 @@ chat :: proc(
 				tokenizer.append_tokens(tb, []int{next})
 				num_prompt_tokens = len(tb.data)
 			}
-
-			if next == EOS_TOKEN_ID {
+			if next == EOS_QWEN3 {
 				fmt.println()
 				user_turn = true
-
 				if tps && timer >= 0 {
 					elapsed := f64(time_in_ms()) - timer
-					if elapsed > 0 {
-						fmt.eprintf("tok/s: %f\n", f64(count) / elapsed * 1000.0)
-					}
-					timer = -1
-					count = 0
+					if elapsed > 0 { fmt.eprintf("tok/s: %f\n", f64(count) / elapsed * 1000.0) }
+					timer = -1; count = 0
 				}
-				if ttft {
-					fmt.eprintf("TTFT: %d ms\n", t_ttft)
-					timer2 = -1
-					t_ttft = 0
-				}
+				if ttft { fmt.eprintf("TTFT: %d ms\n", t_ttft); timer2 = -1; t_ttft = 0 }
 			} else {
+				if rep_penalty > 1.0 { sampler.record_token(samp, next) }
 				decoded := tokenizer.decode_token_id(tok, next)
-				if len(decoded) > 0 {
-					fmt.print(decoded)
-					os.flush(os.stdout)
-				}
+				if len(decoded) > 0 { fmt.print(decoded); os.flush(os.stdout) }
 				delete(decoded)
-				if ttft && t_ttft == 0 {
-					t_ttft = time_in_ms() - timer2
-				}
+				if ttft && t_ttft == 0 { t_ttft = time_in_ms() - timer2 }
 				if tps {
 					count += 1
-					if timer < 0 {
-						timer = f64(time_in_ms())
-					}
+					if timer < 0 { timer = f64(time_in_ms()) }
+				}
+			}
+		}
+	}
+}
+
+// ============================ Qwen3.5 (Ornith) chat loop ============================
+chat_q35 :: proc(
+	engine: ^q35.Engine,
+	tok: ^tok35.Tokenizer,
+	samp: ^sampler.Sampler,
+	think_on, multi_turn, tps, ttft: bool,
+	rep_penalty: f32,
+	tb: ^tok35.Token_Buffer,
+) {
+	system_buf: [8192]u8
+	user_buf: [8192]u8
+	system_prompt: string
+	user_prompt: string
+	prompt_tokens: [dynamic]int
+	defer {
+		delete(system_prompt)
+		delete(user_prompt)
+		delete(prompt_tokens)
+	}
+
+	cfg := q35.engine_config(engine)
+	user_turn := true
+	next: int
+	pos := 0
+	num_prompt_tokens := 0
+	timer: f64 = -1
+	timer2: i64 = -1
+	t_ttft: i64 = 0
+	count := 0
+
+	for {
+		if user_turn {
+			if pos == 0 {
+				system_prompt = read_stdin("Enter system prompt (or Enter to skip): ", &system_buf)
+			}
+			user_prompt = read_stdin("Q: ", &user_buf)
+			if len(user_prompt) == 0 do break
+
+			if ttft && timer2 == -1 { timer2 = time_in_ms() }
+
+			rendered: string
+			if pos == 0 && len(system_prompt) > 0 {
+				rendered = fmt.tprintf(
+					"<|im_start|>system\n%s<|im_end|>\n<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n",
+					system_prompt, user_prompt)
+			} else {
+				rendered = fmt.tprintf("<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n", user_prompt)
+			}
+			if !think_on {
+				rendered = fmt.tprintf("%s<think>\n\n</think>\n", rendered)
+			}
+
+			encoded, err := tok35.encode(tok, rendered)
+			if err != nil { fmt.eprintf("encode failed: %v\n", err); break }
+			clear(&prompt_tokens)
+			append(&prompt_tokens, ..encoded)
+			if rep_penalty > 1.0 {
+				for id in encoded { sampler.record_token(samp, id) }
+			}
+
+			max_ctx := cfg.seq_len
+			if len(prompt_tokens) >= max_ctx {
+				fmt.fprintf(os.stderr, "Prompt is %d tokens but context limit is %d; truncating.\n", len(prompt_tokens), max_ctx)
+				resize(&prompt_tokens, max_ctx - 1)
+			}
+
+			pos = 0
+			user_turn = false
+			if multi_turn {
+				tok35.append_tokens(tb, encoded)
+				num_prompt_tokens = len(tb.data)
+			} else {
+				num_prompt_tokens = len(prompt_tokens)
+			}
+			fmt.fprintf(os.stderr, "Prefilling %d tokens...\n", num_prompt_tokens)
+			fmt.print("A: ")
+			os.flush(os.stdout)
+		}
+
+		token: int
+		if pos < num_prompt_tokens {
+			token = multi_turn ? tb.data[pos] : prompt_tokens[pos]
+		} else {
+			token = next
+		}
+
+		if pos >= cfg.seq_len {
+			fmt.fprintln(os.stderr, "\nContext limit reached; stopping generation.")
+			fmt.println()
+			user_turn = true
+			if tps && timer >= 0 {
+				elapsed := f64(time_in_ms()) - timer
+				if elapsed > 0 { fmt.eprintf("tok/s: %f\n", f64(count) / elapsed * 1000.0) }
+				timer = -1; count = 0
+			}
+			continue
+		}
+
+		logits := q35.engine_forward(engine, token, pos)
+		next = sampler.sample(samp, logits)
+		pos += 1
+
+		if pos >= num_prompt_tokens {
+			if multi_turn {
+				tok35.append_tokens(tb, []int{next})
+				num_prompt_tokens = len(tb.data)
+			}
+			if next == EOS_QWEN3_5 {
+				fmt.println()
+				user_turn = true
+				if tps && timer >= 0 {
+					elapsed := f64(time_in_ms()) - timer
+					if elapsed > 0 { fmt.eprintf("tok/s: %f\n", f64(count) / elapsed * 1000.0) }
+					timer = -1; count = 0
+				}
+				if ttft { fmt.eprintf("TTFT: %d ms\n", t_ttft); timer2 = -1; t_ttft = 0 }
+			} else {
+				if rep_penalty > 1.0 { sampler.record_token(samp, next) }
+				decoded := tok35.decode_token_id(tok, next)
+				if len(decoded) > 0 { fmt.print(decoded); os.flush(os.stdout) }
+				delete(decoded)
+				if ttft && t_ttft == 0 { t_ttft = time_in_ms() - timer2 }
+				if tps {
+					count += 1
+					if timer < 0 { timer = f64(time_in_ms()) }
 				}
 			}
 		}
@@ -225,56 +324,34 @@ dump_gguf :: proc(path: string) {
 	g: ggml.GGUF_File
 	ggml.parse_gguf(path, &g)
 	defer ggml.free_gguf(&g)
-
 	fmt.printf("tensors=%d metadata=%d\n", len(g.tensors), len(g.metadata))
-	counts: map[ggml.GGML_Type]int
-	defer delete(counts)
-	for &t in g.tensors {counts[t.kind] += 1}
-	fmt.printf("type histogram: %v\n", counts)
-	for name in ([]string{"token_embd.weight", "blk.0.ffn_gate.weight", "blk.0.attn_q.weight", "blk.0.ffn_down.weight"}) {
-		if t, ok := ggml.gguf_get_tensor(&g, name); ok {
-			fmt.printf(
-				"%-24s kind=%v dims=%v offset=%d bytes=%d\n",
-				name,
-				t.kind,
-				t.dims,
-				t.offset,
-				len(t.data),
-			)
-			ne := 1
-			for d in t.dims {ne *= int(d)}
-			row_n := int(t.dims[0])
-			scratch := make([]f32, row_n)
-			defer delete(scratch)
-			ggml.dequant_row(t.kind, t.data, row_n, scratch)
-			fmt.printf("  row0[0:8] =")
-			for i in 0 ..< 8 {fmt.printf(" %.5f", scratch[i])}
-			fmt.printf("\n")
-		} else {
-			fmt.printf("%-24s MISSING\n", name)
-		}
+	if arch, ok := ggml.gguf_meta_str(&g, "general.architecture"); ok {
+		fmt.printf("architecture=%s\n", arch)
 	}
 }
 
 error_usage :: proc() {
-	fmt.eprintln("Usage:   qwen3 <FP32 GGUF file> [options]")
-	fmt.eprintln("Example: ./qwen3 Qwen3-0.6B-FP32.gguf")
+	fmt.eprintln("Usage:   odin-infer-mac <model.gguf> [options]")
+	fmt.eprintln("Examples:")
+	fmt.eprintln("  ./odin-infer-mac Qwen3-0.6B-Q4_K_M.gguf -g 1 -t 0 -r 1")
+	fmt.eprintln("  ./odin-infer-mac ornith-1.0-9b-Q4_K_M.gguf -g 1 -c 2048 -x 1.15 -k 1 -r 1")
+	fmt.eprintln("Auto-detects Qwen3 vs Qwen3.5 (Ornith) from the GGUF architecture.")
 	fmt.eprintln("Options:")
-	fmt.eprintln("  -t <float>  temperature in [0,inf], default 0.6")
-	fmt.eprintln("  -p <float>  p value in top-p sampling in [0,1] default 0.95")
-	fmt.eprintln("  -s <int>    random seed, default time(NULL)")
+	fmt.eprintln("  -t <float>  temperature [0,inf], default 0.6 (0 = greedy)")
+	fmt.eprintln("  -p <float>  top-p in [0,1], default 0.95")
+	fmt.eprintln("  -s <int>    random seed, default time()")
 	fmt.eprintln("  -m <int>    multi-turn: 0 = off (default), 1 = on")
-	fmt.eprintln("  -k <int>    reasoning: 0 = off (default), 1 = on")
-	fmt.eprintln("  -r <int>    TPS: 0 = off (default), 1 = on")
-	fmt.eprintln("  -f <int>    TTFT: 0 = off (default), 1 = on")
-	fmt.eprintln("  -j <int>    matmul threads (default: CPU cores)")
-	fmt.eprintln("  -c <int>    max context length (default 4096; caps KV cache memory)")
-	fmt.eprintln("  -g <int>    GPU (Metal): 0 = off (default), 1 = on (Apple Silicon)")
+	fmt.eprintln("  -k <int>    reasoning: 0 = inject empty <think>, 1 = let the model think")
+	fmt.eprintln("  -x <float>  repetition penalty, 1.0 = off (default); try 1.1-1.3")
+	fmt.eprintln("  -r <int>    print tok/s: 0 = off (default), 1 = on")
+	fmt.eprintln("  -f <int>    print TTFT (ms): 0 = off (default), 1 = on")
+	fmt.eprintln("  -j <int>    CPU matmul threads (default: core count)")
+	fmt.eprintln("  -c <int>    max context length (default 4096; caps KV/state memory)")
+	fmt.eprintln("  -g <int>    Metal GPU: 0 = off (default), 1 = on (Apple Silicon)")
 	os.exit(1)
 }
 
 main :: proc() {
-	checkpoint_path: string
 	temperature: f32 = 0.6
 	topp: f32 = 0.95
 	rng_seed: u64 = 0
@@ -282,15 +359,14 @@ main :: proc() {
 	think_on := false
 	tps := false
 	ttft := false
+	rep_penalty: f32 = 1.0
 	num_threads := os.get_processor_core_count()
 	max_ctx := infer.DEFAULT_MAX_CONTEXT
 	use_metal := false
 
 	args := os.args
-	if len(args) < 2 {
-		error_usage()
-	}
-	checkpoint_path = args[1]
+	if len(args) < 2 { error_usage() }
+	checkpoint_path := args[1]
 	debug_tokens = os.get_env("QDBG", context.temp_allocator) == "1"
 
 	if len(args) >= 3 && args[2] == "--dump" {
@@ -302,65 +378,48 @@ main :: proc() {
 	for i < len(args) {
 		if i + 1 >= len(args) do error_usage()
 		if args[i][0] != '-' || len(args[i]) != 2 do error_usage()
-
 		switch args[i][1] {
-		case 't':
-			if val, ok := strconv.parse_f64(args[i + 1]); ok {
-				temperature = f32(val)
-			}
-		case 'p':
-			if val, ok := strconv.parse_f64(args[i + 1]); ok {
-				topp = f32(val)
-			}
-		case 's':
-			if val, ok := strconv.parse_u64(args[i + 1]); ok {
-				rng_seed = val
-			}
-		case 'm':
-			multi_turn = args[i + 1] == "1"
-		case 'k':
-			think_on = args[i + 1] == "1"
-		case 'r':
-			tps = args[i + 1] == "1"
-		case 'f':
-			ttft = args[i + 1] == "1"
-		case 'j':
-			if val, ok := strconv.parse_int(args[i + 1]); ok {
-				num_threads = val
-			}
-		case 'c':
-			if val, ok := strconv.parse_int(args[i + 1]); ok {
-				max_ctx = val
-			}
-		case 'g':
-			use_metal = args[i + 1] == "1"
-		case:
-			error_usage()
+		case 't': if v, ok := strconv.parse_f64(args[i + 1]); ok { temperature = f32(v) }
+		case 'p': if v, ok := strconv.parse_f64(args[i + 1]); ok { topp = f32(v) }
+		case 's': if v, ok := strconv.parse_u64(args[i + 1]); ok { rng_seed = v }
+		case 'm': multi_turn = args[i + 1] == "1"
+		case 'k': think_on = args[i + 1] == "1"
+		case 'x': if v, ok := strconv.parse_f64(args[i + 1]); ok { rep_penalty = f32(v) }
+		case 'r': tps = args[i + 1] == "1"
+		case 'f': ttft = args[i + 1] == "1"
+		case 'j': if v, ok := strconv.parse_int(args[i + 1]); ok { num_threads = v }
+		case 'c': if v, ok := strconv.parse_int(args[i + 1]); ok { max_ctx = v }
+		case 'g': use_metal = args[i + 1] == "1"
+		case: error_usage()
 		}
 		i += 2
 	}
 
-	if rng_seed == 0 {
-		rng_seed = u64(time.time_to_unix(time.now()))
-	}
+	if rng_seed == 0 { rng_seed = u64(time.time_to_unix(time.now())) }
 	if temperature < 0 do temperature = 0
 	if topp < 0 || topp > 1 do topp = 0.9
+	if rep_penalty < 1.0 do rep_penalty = 1.0
 
-	engine, _ := infer.engine_load(checkpoint_path, infer.Engine_Opts{
-		max_ctx     = max_ctx,
-		use_metal   = use_metal,
-		num_threads = num_threads,
-	})
+	kind := detect_arch(checkpoint_path)
+	fmt.eprintf("architecture: %s\n", kind == .Qwen3_5 ? "qwen3_5 (Ornith)" : "qwen3")
+
+	if kind == .Qwen3_5 {
+		run_q35(checkpoint_path, temperature, topp, rng_seed, rep_penalty, think_on, multi_turn, tps, ttft, use_metal, num_threads, max_ctx)
+	} else {
+		run_q3(checkpoint_path, temperature, topp, rng_seed, rep_penalty, think_on, multi_turn, tps, ttft, use_metal, num_threads, max_ctx)
+	}
+}
+
+run_q3 :: proc(
+	path: string, temperature, topp: f32, rng_seed: u64, rep_penalty: f32,
+	think_on, multi_turn, tps, ttft, use_metal: bool, num_threads, max_ctx: int,
+) {
+	engine, _ := infer.engine_load(path, infer.Engine_Opts{max_ctx = max_ctx, use_metal = use_metal, num_threads = num_threads})
 	defer infer.engine_destroy(&engine)
 
 	tok: tokenizer.Tokenizer
 	tokenizer.build_tokenizer(&tok)
 	defer tokenizer.free_tokenizer(&tok)
-	if !tokenizer.verify_tokenizer(&tok) {
-		fmt.eprintln("Tokenizer self-check failed.")
-		os.exit(1)
-	}
-
 	tb: tokenizer.Token_Buffer
 	tokenizer.build_token_buffer(&tb)
 	defer tokenizer.free_token_buffer(&tb)
@@ -369,20 +428,46 @@ main :: proc() {
 	cfg := infer.engine_config(&engine)
 	sampler.build_sampler(&samp, int(cfg.vocab_size), temperature, topp, rng_seed)
 	defer sampler.free_sampler(&samp)
+	if rep_penalty > 1.0 { sampler.enable_repeat_penalty(&samp, rep_penalty) }
 
 	fmt.printf(
-		"Multi-turn = %s, thinKing = %s, tps(R) = %s, ttFt = %s, threads = %d, Temperature = %.2f, top-P = %.2f\n",
-		multi_turn ? "on" : "off",
-		think_on ? "on" : "off",
-		tps ? "on" : "off",
-		ttft ? "on" : "off",
-		num_threads,
-		temperature,
-		topp,
+		"think=%s multi=%s rep=%s tps=%s ttft=%s metal=%s threads=%d T=%.2f P=%.2f\n",
+		think_on ? "on" : "off", multi_turn ? "on" : "off",
+		rep_penalty > 1.0 ? "on" : "off", tps ? "on" : "off", ttft ? "on" : "off",
+		use_metal ? "on" : "off", num_threads, temperature, topp,
 	)
 	fmt.println("Press Enter to exit the chat")
-
-	chat(&engine, &tok, &samp, think_on, multi_turn, tps, ttft, &tb)
-
+	chat_q3(&engine, &tok, &samp, think_on, multi_turn, tps, ttft, rep_penalty, &tb)
 	infer.destroy_matmul_pool()
+}
+
+run_q35 :: proc(
+	path: string, temperature, topp: f32, rng_seed: u64, rep_penalty: f32,
+	think_on, multi_turn, tps, ttft, use_metal: bool, num_threads, max_ctx: int,
+) {
+	engine, _ := q35.engine_load(path, q35.Engine_Opts{max_ctx = max_ctx, use_metal = use_metal, num_threads = num_threads})
+	defer q35.engine_destroy(&engine)
+
+	tok: tok35.Tokenizer
+	tok35.build_tokenizer(&tok)
+	defer tok35.free_tokenizer(&tok)
+	tb: tok35.Token_Buffer
+	tok35.build_token_buffer(&tb)
+	defer tok35.free_token_buffer(&tb)
+
+	samp: sampler.Sampler
+	cfg := q35.engine_config(&engine)
+	sampler.build_sampler(&samp, int(cfg.vocab_size), temperature, topp, rng_seed)
+	defer sampler.free_sampler(&samp)
+	if rep_penalty > 1.0 { sampler.enable_repeat_penalty(&samp, rep_penalty) }
+
+	fmt.printf(
+		"think=%s multi=%s rep=%s tps=%s ttft=%s metal=%s threads=%d T=%.2f P=%.2f\n",
+		think_on ? "on" : "off", multi_turn ? "on" : "off",
+		rep_penalty > 1.0 ? "on" : "off", tps ? "on" : "off", ttft ? "on" : "off",
+		use_metal ? "on" : "off", num_threads, temperature, topp,
+	)
+	fmt.println("Press Enter to exit the chat")
+	chat_q35(&engine, &tok, &samp, think_on, multi_turn, tps, ttft, rep_penalty, &tb)
+	q35.destroy_matmul_pool()
 }
