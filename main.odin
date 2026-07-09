@@ -264,6 +264,16 @@ chat_q35 :: proc(
 				num_prompt_tokens = len(prompt_tokens)
 			}
 			fmt.fprintf(os.stderr, "Prefilling %d tokens...\n", num_prompt_tokens)
+			// BATCHED PREFILL (Stage 1a): process the first N-1 prompt tokens as
+			// matrix-matrix (Q4_K MMQ) batches; the last prompt token runs through
+			// the normal loop so the first generated token is emitted naturally.
+			// (engine_forward_batch self-dispatches Metal batch vs CPU per-token.)
+			if num_prompt_tokens > 1 {
+				m := num_prompt_tokens - 1
+				src := multi_turn ? tb.data[:m] : prompt_tokens[:m]
+				_ = q35.engine_forward_batch(engine, src, 0)
+				pos = m
+			}
 			fmt.print("A: ")
 			os.flush(os.stdout)
 		}
