@@ -16,6 +16,7 @@ import "core:os"
 import "core:strconv"
 import "core:strings"
 import "core:time"
+import "base:runtime"
 
 EOS_QWEN3   :: 151645  // <|im_end|>
 EOS_QWEN3_5 :: 248046  // <|im_end|>
@@ -362,6 +363,7 @@ error_usage :: proc() {
 	fmt.eprintln("  -g <int>    Metal GPU: 0 = off (default), 1 = on (Apple Silicon)")
 	fmt.eprintln("  -L <path>   load KV+SSM state from .oikv file (Qwen3.5 only, resumes chat)")
 	fmt.eprintln("  -S <path>   save KV+SSM state to .oikv on exit (Qwen3.5 only)")
+	fmt.eprintln("  -J <int>    force JSON output (Qwen3.5 only): 0 = off (default), 1 = on")
 	os.exit(1)
 }
 
@@ -379,6 +381,7 @@ main :: proc() {
 	use_metal := false
 	load_kv_path: string = ""
 	save_kv_path: string = ""
+	json_mode := false
 
 	args := os.args
 	if len(args) < 2 { error_usage() }
@@ -408,6 +411,7 @@ main :: proc() {
 		case 'g': use_metal = args[i + 1] == "1"
 		case 'L': load_kv_path = args[i + 1]
 		case 'S': save_kv_path = args[i + 1]
+		case 'J': json_mode = args[i + 1] == "1"
 		case: error_usage()
 		}
 		i += 2
@@ -422,10 +426,13 @@ main :: proc() {
 	fmt.eprintf("architecture: %s\n", kind == .Qwen3_5 ? "qwen3_5 (Ornith)" : "qwen3")
 
 	if kind == .Qwen3_5 {
-		run_q35(checkpoint_path, temperature, topp, rng_seed, rep_penalty, think_on, multi_turn, tps, ttft, use_metal, num_threads, max_ctx, load_kv_path, save_kv_path)
+		run_q35(checkpoint_path, temperature, topp, rng_seed, rep_penalty, think_on, multi_turn, tps, ttft, use_metal, num_threads, max_ctx, load_kv_path, save_kv_path, json_mode)
 	} else {
 		if len(load_kv_path) > 0 || len(save_kv_path) > 0 {
 			fmt.eprintln("warning: -L/-S KV persistence only supported on Qwen3.5; ignoring")
+		}
+		if json_mode {
+			fmt.eprintln("warning: -J JSON mode only supported on Qwen3.5; ignoring")
 		}
 		run_q3(checkpoint_path, temperature, topp, rng_seed, rep_penalty, think_on, multi_turn, tps, ttft, use_metal, num_threads, max_ctx)
 	}
@@ -466,6 +473,7 @@ run_q35 :: proc(
 	path: string, temperature, topp: f32, rng_seed: u64, rep_penalty: f32,
 	think_on, multi_turn, tps, ttft, use_metal: bool, num_threads, max_ctx: int,
 	load_kv_path, save_kv_path: string,
+	json_mode: bool,
 ) {
 	engine, _ := q35.engine_load(path, q35.Engine_Opts{max_ctx = max_ctx, use_metal = use_metal, num_threads = num_threads})
 	defer q35.engine_destroy(&engine)
@@ -494,6 +502,26 @@ run_q35 :: proc(
 	defer sampler.free_sampler(&samp)
 	if rep_penalty > 1.0 { sampler.enable_repeat_penalty(&samp, rep_penalty) }
 
+	// JSON grammar-constrained output (Qwen3.5 only)
+	grammar: sampler.JSON_Grammar
+	if json_mode {
+		fmt.eprintln("json: building token-bytes cache (one-time, may take a few seconds)…")
+		t0 := time_in_ms()
+		// Inline build_token_cache: closures in Odin can't capture locals, so
+		// we can't pass `tok` via the callback API. Iterate directly.
+		vs := int(cfg.vocab_size)
+		token_bytes := make([][]u8, vs)
+		for id in 0 ..< vs {
+			s := tok35.decode_token_id(&tok, id)
+			token_bytes[id] = transmute([]u8)s
+		}
+		grammar = sampler.init_json()
+		samp.grammar = &grammar
+		samp.token_bytes = token_bytes
+		samp.eos_token = EOS_QWEN3_5
+		fmt.eprintfln("json: ready (%d ms, vocab=%d)", (time_in_ms() - t0), vs)
+	}
+
 	fmt.printf(
 		"think=%s multi=%s rep=%s tps=%s ttft=%s metal=%s threads=%d T=%.2f P=%.2f\n",
 		think_on ? "on" : "off", multi_turn ? "on" : "off",
@@ -502,6 +530,9 @@ run_q35 :: proc(
 	)
 	fmt.println("Press Enter to exit the chat")
 	final_pos := chat_q35(&engine, &tok, &samp, think_on, multi_turn, tps, ttft, rep_penalty, &tb, initial_pos)
+	if json_mode {
+		sampler.free_json(&grammar)
+	}
 	if len(save_kv_path) > 0 {
 		if !q35.engine_save_kv(&engine, save_kv_path, final_pos) {
 			fmt.eprintln("kv: save failed")
