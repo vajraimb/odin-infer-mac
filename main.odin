@@ -197,7 +197,8 @@ chat_q35 :: proc(
 	think_on, multi_turn, tps, ttft: bool,
 	rep_penalty: f32,
 	tb: ^tok35.Token_Buffer,
-) {
+	initial_pos: int,
+) -> int {
 	system_buf: [8192]u8
 	user_buf: [8192]u8
 	system_prompt: string
@@ -212,7 +213,7 @@ chat_q35 :: proc(
 	cfg := q35.engine_config(engine)
 	user_turn := true
 	next: int
-	pos := 0
+	pos := initial_pos
 	num_prompt_tokens := 0
 	timer: f64 = -1
 	timer2: i64 = -1
@@ -328,6 +329,7 @@ chat_q35 :: proc(
 			}
 		}
 	}
+	return pos
 }
 
 dump_gguf :: proc(path: string) {
@@ -358,6 +360,8 @@ error_usage :: proc() {
 	fmt.eprintln("  -j <int>    CPU matmul threads (default: core count)")
 	fmt.eprintln("  -c <int>    max context length (default 4096; caps KV/state memory)")
 	fmt.eprintln("  -g <int>    Metal GPU: 0 = off (default), 1 = on (Apple Silicon)")
+	fmt.eprintln("  -L <path>   load KV+SSM state from .oikv file (Qwen3.5 only, resumes chat)")
+	fmt.eprintln("  -S <path>   save KV+SSM state to .oikv on exit (Qwen3.5 only)")
 	os.exit(1)
 }
 
@@ -373,6 +377,8 @@ main :: proc() {
 	num_threads := os.get_processor_core_count()
 	max_ctx := infer.DEFAULT_MAX_CONTEXT
 	use_metal := false
+	load_kv_path: string = ""
+	save_kv_path: string = ""
 
 	args := os.args
 	if len(args) < 2 { error_usage() }
@@ -400,6 +406,8 @@ main :: proc() {
 		case 'j': if v, ok := strconv.parse_int(args[i + 1]); ok { num_threads = v }
 		case 'c': if v, ok := strconv.parse_int(args[i + 1]); ok { max_ctx = v }
 		case 'g': use_metal = args[i + 1] == "1"
+		case 'L': load_kv_path = args[i + 1]
+		case 'S': save_kv_path = args[i + 1]
 		case: error_usage()
 		}
 		i += 2
@@ -414,8 +422,11 @@ main :: proc() {
 	fmt.eprintf("architecture: %s\n", kind == .Qwen3_5 ? "qwen3_5 (Ornith)" : "qwen3")
 
 	if kind == .Qwen3_5 {
-		run_q35(checkpoint_path, temperature, topp, rng_seed, rep_penalty, think_on, multi_turn, tps, ttft, use_metal, num_threads, max_ctx)
+		run_q35(checkpoint_path, temperature, topp, rng_seed, rep_penalty, think_on, multi_turn, tps, ttft, use_metal, num_threads, max_ctx, load_kv_path, save_kv_path)
 	} else {
+		if len(load_kv_path) > 0 || len(save_kv_path) > 0 {
+			fmt.eprintln("warning: -L/-S KV persistence only supported on Qwen3.5; ignoring")
+		}
 		run_q3(checkpoint_path, temperature, topp, rng_seed, rep_penalty, think_on, multi_turn, tps, ttft, use_metal, num_threads, max_ctx)
 	}
 }
@@ -454,9 +465,21 @@ run_q3 :: proc(
 run_q35 :: proc(
 	path: string, temperature, topp: f32, rng_seed: u64, rep_penalty: f32,
 	think_on, multi_turn, tps, ttft, use_metal: bool, num_threads, max_ctx: int,
+	load_kv_path, save_kv_path: string,
 ) {
 	engine, _ := q35.engine_load(path, q35.Engine_Opts{max_ctx = max_ctx, use_metal = use_metal, num_threads = num_threads})
 	defer q35.engine_destroy(&engine)
+
+	// Optional KV+SSM state restore.
+	initial_pos := 0
+	if len(load_kv_path) > 0 {
+		pos, ok := q35.engine_load_kv(&engine, load_kv_path)
+		if ok {
+			initial_pos = pos
+		} else {
+			fmt.eprintln("kv: load failed; starting fresh")
+		}
+	}
 
 	tok: tok35.Tokenizer
 	tok35.build_tokenizer(&tok)
@@ -478,6 +501,11 @@ run_q35 :: proc(
 		use_metal ? "on" : "off", num_threads, temperature, topp,
 	)
 	fmt.println("Press Enter to exit the chat")
-	chat_q35(&engine, &tok, &samp, think_on, multi_turn, tps, ttft, rep_penalty, &tb)
+	final_pos := chat_q35(&engine, &tok, &samp, think_on, multi_turn, tps, ttft, rep_penalty, &tb, initial_pos)
+	if len(save_kv_path) > 0 {
+		if !q35.engine_save_kv(&engine, save_kv_path, final_pos) {
+			fmt.eprintln("kv: save failed")
+		}
+	}
 	q35.destroy_matmul_pool()
 }
